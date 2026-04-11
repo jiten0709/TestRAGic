@@ -333,17 +333,6 @@ chmod 755 src/tests/
 
 ---
 
-## 🤝 Support & Resources
-
-| Resource          | Link                                                                     |
-| ----------------- | ------------------------------------------------------------------------ |
-| **Report Issues** | [GitHub Issues](https://github.com/jiten0709/TestRAGic/issues)           |
-| **Documentation** | Check inline code comments and docstrings                                |
-| **Testing**       | Use mock data ("test" URL) for safe testing                              |
-| **Discussions**   | [GitHub Discussions](https://github.com/jiten0709/TestRAGic/discussions) |
-
----
-
 ## 📊 Performance Benchmarks
 
 | Metric                   | Performance                 |
@@ -353,12 +342,6 @@ chmod 755 src/tests/
 | Cross-Browser Coverage   | 3 browsers simultaneously   |
 | Artifact Processing      | Real-time during execution  |
 | Report Generation        | <30 seconds per test run    |
-
----
-
-## 📝 License
-
-This project is open source. See LICENSE file for details.
 
 ---
 
