@@ -3,7 +3,6 @@ Utils Module - Utility functions and helper classes
 
 This module provides utility functions for:
 - Video processing and analysis
-- LLM integration and RAG operations
 - Playwright script conversion
 - Data processing and validation
 """
@@ -17,13 +16,6 @@ except ImportError as e:
     VideoProcessor = None
 
 try:
-    from .llm_client import LLMClient
-    print("✅ LLMClient imported successfully")
-except ImportError as e:
-    print(f"⚠️ Warning: Could not import LLMClient: {e}")
-    LLMClient = None
-
-try:
     from .playwright_converter import PlaywrightConverter
     print("✅ PlaywrightConverter imported successfully")
 except ImportError as e:
@@ -35,8 +27,6 @@ __all__ = []
 
 if VideoProcessor:
     __all__.append("VideoProcessor")
-if LLMClient:
-    __all__.append("LLMClient")
 if PlaywrightConverter:
     __all__.append("PlaywrightConverter")
 

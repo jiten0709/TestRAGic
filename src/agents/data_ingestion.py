@@ -21,9 +21,9 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import whisper
 
 # LangChain imports
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-# from langchain_community.chat_models import ChatOpenAI
+
+from src.utils import provider
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
@@ -42,8 +42,13 @@ class DataIngestionAgent:
         # Create directories
         self._create_directories()
         
-        # Initialize components
-        self.embeddings = OpenAIEmbeddings()
+        # Initialize components. Embeddings go through src/utils/provider.py, which
+        # exposes the same LangChain interface FAISS expects. An existing store pins
+        # the vector width -- mixing widths would corrupt it, so pass it through.
+        store_meta = provider.read_store_meta(self.data_dir / "vector_store") or {}
+        self.embeddings = provider.OmniRouteEmbeddings(
+            expected_dimensions=store_meta.get("dimensions")
+        )
         self.vector_store = None
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -753,11 +758,19 @@ class DataIngestionAgent:
                 vector_store_path = self.data_dir / "vector_store"
                 vector_store_path.mkdir(exist_ok=True)
                 self.vector_store.save_local(str(vector_store_path))
+
+                attribution = self.embeddings.last_attribution
+                if attribution:
+                    provider.write_store_meta(
+                        vector_store_path, attribution, self.embeddings.dimensions
+                    )
                 
                 return {
                     "success": True,
                     "documents_count": len(documents),
-                    "vector_store_path": str(vector_store_path)
+                    "vector_store_path": str(vector_store_path),
+                    "embedding_attribution": attribution.to_dict() if attribution else None,
+                    "embedding_dimensions": self.embeddings.dimensions
                 }
             else:
                 return {"success": False, "error": "No documents to vectorize"}
@@ -772,6 +785,17 @@ class DataIngestionAgent:
             # Try to load existing vector store
             vector_store_path = self.data_dir / "vector_store"
             if vector_store_path.exists():
+                stored = provider.read_store_meta(vector_store_path) or {}
+                configured = provider.model_dimensions(self.embeddings.model)
+                if stored.get("dimensions") and configured and stored["dimensions"] != configured:
+                    logger.error(
+                        "Vector store was built with %s (%s dims) but %s produces %s dims. "
+                        "Vectors of different widths are not comparable -- clear "
+                        "src/data/vector_store/ and re-ingest.",
+                        stored.get("model"), stored["dimensions"],
+                        self.embeddings.model, configured,
+                    )
+                    return None
                 try:
                     self.vector_store = FAISS.load_local(
                         str(vector_store_path), 

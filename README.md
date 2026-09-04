@@ -114,9 +114,9 @@
 | Layer                  | Technologies                           |
 | ---------------------- | -------------------------------------- |
 | **Language**           | Python 3.13                            |
-| **LLM Orchestration**  | LangChain, OpenAI GPT-4o               |
+| **LLM Gateway**        | OmniRoute (350+ providers), OpenAI SDK |
 | **Browser Automation** | Playwright                             |
-| **Vector Databases**   | FAISS, ChromaDB                        |
+| **Vector Database**    | FAISS (`IndexFlatL2`)                  |
 | **Video Processing**   | PyTube, yt-dlp, YouTube Transcript API |
 | **Speech-to-Text**     | Whisper (fallback), YouTube API        |
 
@@ -131,11 +131,11 @@
 
 ### AI & ML Components
 
-- **Large Language Models**: OpenAI GPT-4o for intelligent analysis
+- **Large Language Models**: any provider reachable through OmniRoute; `auto` by default
 - **RAG Pipeline**: Vector-based semantic search for context retrieval
-- **Vector Storage**: FAISS and ChromaDB for efficient embeddings
+- **Vector Storage**: FAISS for efficient embeddings
 - **NLP Processing**: LangChain for text understanding
-- **Embeddings**: OpenAI embeddings for content vectorization
+- **Embeddings**: user-selectable embedding model, routed through the same gateway
 
 ---
 
@@ -143,8 +143,9 @@
 
 ### Prerequisites
 
-- Python 3.11 or higher
-- OpenAI API key (GPT-4o access)
+- Python 3.13
+- An AI provider: either an OmniRoute gateway (Node >= 22, or Docker) **or** an OpenAI API key
+- Node.js >= 22.22.2 — only if you run OmniRoute via npm
 - 4GB+ RAM recommended
 - macOS, Linux, or Windows
 
@@ -167,9 +168,52 @@ pip install -r requirements.txt
 playwright install
 
 # Configure environment variables
-cp .env.example .env
-# Edit .env and add: OPENAI_API_KEY=sk-your-key-here
+cp src/.env.example src/.env
 ```
+
+### 1b. Configure an AI provider
+
+TestRAGic talks to exactly one OpenAI-compatible endpoint, chosen by `src/.env`.
+
+**Option A — OmniRoute gateway (recommended).** OmniRoute is a local
+OpenAI-compatible router: one endpoint, 350+ providers, built-in failover, and
+per-provider credentials that live in its dashboard rather than in this repo.
+
+```bash
+npm i -g omniroute && omniroute          # boots the gateway + dashboard on :20128
+# or, without Node:
+docker run -d -p 127.0.0.1:20128:20128 -v omniroute-data:/app/data \
+  diegosouzapw/omniroute:latest
+
+# then in src/.env:
+#   OMNIROUTE_BASE_URL=http://localhost:20128/v1
+```
+
+Open <http://localhost:20128> to connect providers. A fresh install answers with
+no credentials at all, so `OMNIROUTE_LLM_MODEL=auto` works immediately.
+
+**Option B — OpenAI directly.** Leave `OMNIROUTE_BASE_URL` empty and set
+`OPENAI_API_KEY` in `src/.env`. The app behaves exactly as it did before the
+migration.
+
+#### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OMNIROUTE_BASE_URL` | _(empty)_ | Gateway endpoint. **Setting this is what selects OmniRoute mode.** |
+| `OMNIROUTE_API_KEY` | _(empty)_ | Gateway key. Optional — a local instance runs with `REQUIRE_API_KEY=false`. |
+| `OMNIROUTE_LLM_MODEL` | `auto` | Persistent default chat model. `auto`, `auto/fast`, `provider/model`, … |
+| `OMNIROUTE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Persistent default embedding model (1536 dims). |
+| `OMNIROUTE_TIMEOUT` | `60` | Per-request timeout in seconds; bounds the fallback chain. |
+| `TESTRAGIC_LLM_PROVIDER` | _(unset)_ | Force `omniroute` or `openai`, overriding the rule above. |
+| `OPENAI_API_KEY` | _(empty)_ | Used when no gateway is configured. |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Default model in OpenAI-direct mode. |
+
+`BASE_URL` is unrelated — it is the Playwright **test target** URL (`conftest.py`).
+
+Model choice is also available in the UI (Settings → AI Provider, and the Test
+Generation dropdown), but UI choices last for the session only, exactly like the
+API key. Edit `src/.env` for a permanent default; Settings shows a copyable snippet.
 
 ### 2. Launch the Application
 
@@ -190,14 +234,23 @@ pytest src/tests/generated/test_sample.py -v
 
 # Verify all dependencies
 python -c "import streamlit, playwright, openai, langchain; print('✅ All dependencies installed!')"
+
+# Provider unit tests (no network, no browser)
+pytest src/tests/unit -o addopts="" -q
+
+# Live smoke test against a running OmniRoute gateway.
+# Skipped automatically when no gateway is reachable.
+OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
+  pytest src/tests/unit/test_live_omniroute.py -o addopts="" -q -s
 ```
 
 ### 4. First Test Run
 
-1. **Configure API Key**
-   - Go to Settings in sidebar
-   - Enter your OpenAI API key
-   - Test connection
+1. **Configure the AI provider**
+   - Go to Settings → AI Provider in the sidebar
+   - Set the OmniRoute base URL, or an OpenAI API key
+   - Pick the default LLM and embedding models
+   - **Test connection** — it reports which provider actually answered
 
 2. **Try Mock Data** (recommended first)
    - Use `"test"` as video URL
@@ -249,7 +302,7 @@ python -c "import streamlit, playwright, openai, langchain; print('✅ All depen
 - AI-Powered Test Generation with RAG
 - Streamlit Dashboard (multi-page interface)
 - Playwright Test Execution Framework
-- Vector Storage (FAISS & ChromaDB)
+- Vector Storage (FAISS)
 - Mock Data Testing
 - Multi-format Exports (JSON, Markdown)
 - Multiple Input Methods (files, URLs, links)
@@ -281,15 +334,32 @@ python -c "import streamlit, playwright, openai, langchain; print('✅ All depen
 
 ## 🛠️ Troubleshooting
 
-### ❌ OpenAI API Key Issues
+### ❌ AI provider issues
 
 ```bash
-# Error: Invalid API key or connection failed
-# Solutions:
-# 1. Verify key starts with 'sk-'
-# 2. Check account has sufficient credits
-# 3. Regenerate key from OpenAI dashboard
-# 4. Ensure .env file is in project root
+# "No AI provider configured"
+#   Neither OMNIROUTE_BASE_URL nor OPENAI_API_KEY is set. Set one in src/.env,
+#   or configure it on the Settings page.
+
+# "Connection failed via omniroute at http://localhost:20128/v1"
+#   The gateway is not running. Start it:
+npm i -g omniroute && omniroute
+curl -i http://localhost:20128/v1/models      # should return 200 + X-OmniRoute-* headers
+
+# "Generated by: <model> (requested; gateway did not report)"
+#   The response carried no X-OmniRoute-Provider/-Model header — usually a reverse
+#   proxy stripping X-* headers. Attribution degrades honestly; it never guesses.
+
+# "No model produced this result. Tried: ..."
+#   Every rung of the fallback chain failed; the message names each one and why.
+#   Any test cases shown are stubs, and are labelled as such.
+
+# Model dropdown shows a static list with a warning
+#   GET /v1/models was unreachable. The app never presents a stale list as live.
+#   Press 🔄 next to the dropdown after fixing the gateway.
+
+# NOTE: there is no API key *format* check any more. A gateway key is whatever
+# its operator chose, and a local OmniRoute instance is keyless by default.
 ```
 
 ### ❌ YouTube Download Failures

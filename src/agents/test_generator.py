@@ -17,9 +17,33 @@ from typing import Dict, List
 from langchain.prompts import ChatPromptTemplate
 from pathlib import Path
 
+from src.utils import provider
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def _scan_json(text):
+    r"""Yield every JSON array/object embedded in `text`, nesting included.
+
+    json.JSONDecoder().raw_decode understands nested structures; the regex it
+    replaces (r'\{[^{}]*\}') matched only flat objects, so any test case with a
+    nested "steps" list of objects was silently dropped on the floor.
+    """
+    decoder = json.JSONDecoder()
+    index, length = 0, len(text)
+    while index < length:
+        if text[index] in "[{":
+            try:
+                value, end = decoder.raw_decode(text, index)
+            except ValueError:
+                index += 1
+                continue
+            yield value
+            index = end
+        else:
+            index += 1
+
 
 # Template Constants
 FUNCTIONAL_TEMPLATE = """You are an expert QA engineer specializing in frontend test automation. 
@@ -129,24 +153,12 @@ Focus on:
 class TestGeneratorAgent:
     def __init__(self, model="gpt-4o-mini"):
         """Initialize Test Generator Agent"""
-        self.model = model
-        
-        # Initialize LLM with proper import
-        try:
-            from langchain_openai import ChatOpenAI
-            self.llm = ChatOpenAI(
-                model=self.model,
-                temperature=0.3,
-                max_tokens=4000
-            )
-        except ImportError:
-            # Fallback to old import
-            from langchain.chat_models import ChatOpenAI
-            self.llm = ChatOpenAI(
-                model=self.model,
-                temperature=0.3,
-                max_tokens=4000
-            )
+        self.model = model or provider.default_chat_model()
+
+        # No client is constructed here: every call goes through src/utils/provider.py,
+        # which owns the endpoint, the fallback chain and the attribution headers.
+        self.retriever = None
+        self._attributions = []  # (category, Attribution), one per generated category
         
         # Test case templates
         self.templates = {
@@ -257,6 +269,14 @@ class TestGeneratorAgent:
     def generate_test_cases(self, user_flow: str, context: str = "") -> Dict:
         """Generate comprehensive test cases for a user flow"""
         try:
+            # Legacy path, superseded by generate_comprehensive_tests. It was already
+            # unreachable (it uses a retriever nothing ever sets); the guard keeps its
+            # five stale call sites from failing obscurely after the provider migration.
+            raise NotImplementedError(
+                "generate_test_cases is the legacy single-flow path and is not wired up; "
+                "use generate_comprehensive_tests(video_content, categories, priorities)."
+            )
+
             logger.info(f"Generating test cases for user flow: {user_flow[:50]}...")
             
             # Get relevant context from video content if retriever is available
@@ -493,6 +513,7 @@ class TestGeneratorAgent:
             video_info = video_content.get('video_info', {})
             
             all_test_cases = []
+            self._attributions = []
             
             for category in categories:
                 # Generate test cases for each category
@@ -510,13 +531,18 @@ class TestGeneratorAgent:
                 """
                 
                 try:
-                    response = self.llm.invoke(prompt)
+                    text, attribution = provider.chat(prompt, model=self.model)
+                    self._attributions.append((category, attribution))
                     # Parse and add test cases
-                    test_cases = self._parse_llm_response(response.content, category)
+                    test_cases = self._parse_llm_response(text, category)
                     all_test_cases.extend(test_cases)
                 except Exception as e:
                     logger.warning(f"Failed to generate {category} tests: {e}")
-                    # Add fallback test case
+                    # No model produced this: the stub must say so, or it is
+                    # indistinguishable from generated output.
+                    self._attributions.append(
+                        (category, provider.unattributed(f"all models failed: {e}"))
+                    )
                     all_test_cases.append(self._create_fallback_test_case(category))
             
             return all_test_cases
@@ -530,21 +556,17 @@ class TestGeneratorAgent:
         # Simple parsing - you can make this more sophisticated
         test_cases = []
         
-        # Try to extract JSON from response
-        import json
-        import re
-        
         try:
-            # Look for JSON blocks in the response
-            json_matches = re.findall(r'\{[^{}]*\}', response_text, re.DOTALL)
-            
-            for match in json_matches:
-                try:
-                    test_case = json.loads(match)
-                    test_case['category'] = category
-                    test_cases.append(test_case)
-                except:
-                    continue
+            # Scan for JSON values with the decoder itself. The previous
+            # regex r'\{[^{}]*\}' could not match nested objects, so any test case
+            # with a nested "steps" object was silently discarded.
+            for value in _scan_json(response_text):
+                if isinstance(value, dict) and isinstance(value.get('test_cases'), list):
+                    value = value['test_cases']
+                for case in (value if isinstance(value, list) else [value]):
+                    if isinstance(case, dict) and case:
+                        case['category'] = category
+                        test_cases.append(case)
                     
             if not test_cases:
                 # Fallback: create basic test case from text
@@ -595,6 +617,9 @@ class TestGeneratorAgent:
                 'generated_at': datetime.datetime.now().isoformat(),
                 'total_cases': len(test_cases),
                 'generator': 'TestGeneratorAgent',
-                'model': self.model
+                # 'model' keeps its existing meaning (what we asked for); who actually
+                # answered lives under 'attribution'.
+                'model': self.model,
+                'attribution': provider.summarize(self._attributions)
             }
         }
