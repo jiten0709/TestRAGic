@@ -265,6 +265,26 @@ class TestGeneratorAgent:
         """Set the retriever from data ingestion agent"""
         self.retriever = retriever
         logger.info("Retriever set for context-aware test generation")
+
+    def _context_for(self, category, transcript):
+        """Source material for one category's prompt.
+
+        Without a retriever every category gets `transcript[:2000]` -- the same
+        first ~2000 *characters* of the video, so accessibility tests are written
+        from whatever was said in the opening ninety seconds. Retrieval queries the
+        vector store with the category name instead, which is also what makes the
+        chosen embedding model affect the output at all.
+        """
+        if self.retriever:
+            try:
+                docs = self.retriever.invoke(category)
+                chunks = "\n\n".join(d.page_content for d in docs)
+                if chunks.strip():
+                    return chunks
+                logger.warning("Retrieval returned nothing for %s; using transcript head", category)
+            except Exception as e:
+                logger.warning("Retrieval failed for %s, using transcript head: %s", category, e)
+        return f"{transcript[:2000]}..."
     
     def generate_test_cases(self, user_flow: str, context: str = "") -> Dict:
         """Generate comprehensive test cases for a user flow"""
@@ -518,12 +538,13 @@ class TestGeneratorAgent:
             for category in categories:
                 # Generate test cases for each category
                 template = self.templates.get(category.lower().replace(' ', '_'), self.templates['functional'])
-                
+                context = self._context_for(category, transcript)
+
                 prompt = f"""
                 Based on the following video content, generate test cases for {category}:
                 
                 Video Title: {video_info.get('title', 'Unknown')}
-                Video Transcript: {transcript[:2000]}...
+                Video Transcript: {context}
                 
                 {template}
                 

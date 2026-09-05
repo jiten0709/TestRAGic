@@ -575,6 +575,11 @@ def generate_test_cases_from_url(url, categories, priorities, model):
             st.error(f"❌ Video processing failed: {video_content.get('error')}")
             return
         
+        # Feed the freshly-built vector store to the generator so each category is
+        # prompted with chunks relevant to it. Returns None on the mock path (no
+        # store was built) and the generator falls back to the transcript head.
+        test_agent.set_retriever(data_agent.setup_retrieval_chain())
+        
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
         progress_bar.progress(50)
@@ -824,6 +829,9 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         status_text.text("🎬 Processing video file...")
         progress_bar.progress(25)
         video_content = data_agent.process_video_file(str(temp_file_path))
+        
+        # See the URL path: retrieval-backed context, transcript head if unavailable.
+        test_agent.set_retriever(data_agent.setup_retrieval_chain())
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")

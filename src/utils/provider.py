@@ -258,13 +258,22 @@ def list_embedding_models(refresh: bool = False) -> tuple[list[dict], str | None
     """Embedding models from OmniRoute's ``GET /v1/embeddings`` catalog."""
     gateway = resolve_endpoint().gateway
     entries, warning = _fetch_catalog("/embeddings", refresh)
-    if entries is None:
+    # An empty catalog is as unusable as an unreachable one: OmniRoute answers 200 with
+    # data:[] when it holds no embedding-provider credentials, and returning ([], None)
+    # left the Settings dropdown empty with nothing explaining why.
+    if not entries:
         ids = (
             ["openai/text-embedding-3-small", "openai/text-embedding-3-large", "openai/text-embedding-ada-002"]
             if gateway == "omniroute"
             else list(KNOWN_DIMENSIONS)
         )
-        note = "Embedding catalog unavailable; showing a static list."
+        note = (
+            f"Embedding catalog unreachable ({warning}); showing a static list."
+            if entries is None
+            else "This gateway reports no embedding models -- it likely holds no embedding "
+                 "provider credentials. The list below is static and these models may be "
+                 "rejected; RAG stays off until one works."
+        )
         return _static(ids), (note if gateway == "omniroute" else None)
     for e in entries:
         e.setdefault("dimensions", KNOWN_DIMENSIONS.get(str(e["id"]).rpartition("/")[2]))

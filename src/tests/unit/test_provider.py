@@ -117,6 +117,18 @@ def test_embedding_catalog_404_on_the_gateway_does_warn(gateway):
     assert models and warning
 
 
+def test_an_empty_embedding_catalog_warns_instead_of_emptying_the_dropdown(gateway):
+    """A real OmniRoute instance holding no embedding-provider credentials answers
+    200 with data:[]. That used to return ([], None): an empty Settings dropdown and
+    nothing saying why."""
+    gateway.embedding_catalog = []
+    models, warning = provider.list_embedding_models()
+
+    assert models, "never present an empty dropdown"
+    assert warning and "no embedding models" in warning
+    assert "RAG stays off" in warning, "the consequence must be stated, not just the fact"
+
+
 def test_model_dimensions_falls_back_to_the_static_map():
     assert provider.model_dimensions("text-embedding-3-small") == 1536
     assert provider.model_dimensions("openai/text-embedding-3-large") == 3072

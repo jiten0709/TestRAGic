@@ -121,3 +121,78 @@ def test_the_legacy_single_flow_path_is_explicitly_not_wired(gateway):
     assert result["success"] is False
     assert "generate_comprehensive_tests" in result["error"]
     assert gateway.chat_models_called == []
+
+
+# --------------------------------------------------------------------------
+# retrieval-backed context (the embedding setting only matters if this runs)
+# --------------------------------------------------------------------------
+
+class FakeRetriever:
+    """Stands in for a FAISS VectorStoreRetriever: records the query, returns chunks."""
+
+    def __init__(self, chunks=("clicking the signup button opens the form",), boom=None):
+        self.chunks = chunks
+        self.boom = boom
+        self.queries = []
+
+    def invoke(self, query):
+        self.queries.append(query)
+        if self.boom:
+            raise self.boom
+        return [type("Doc", (), {"page_content": c})() for c in self.chunks]
+
+
+def _capture_prompts(gateway):
+    seen = []
+
+    def capture(request, body):
+        seen.append(body["messages"][-1]["content"])
+        return gateway.chat_ok(content="[]")(request, body)
+
+    gateway.default_chat = capture
+    return seen
+
+
+def test_each_category_queries_the_retriever_and_its_chunks_reach_the_prompt(gateway):
+    prompts = _capture_prompts(gateway)
+    retriever = FakeRetriever(chunks=("chunk about accessibility", "second chunk"))
+
+    agent = TestGeneratorAgent(model="auto")
+    agent.set_retriever(retriever)
+    agent.generate_comprehensive_tests(VIDEO, ["ui", "accessibility"], ["high"])
+
+    assert retriever.queries == ["ui", "accessibility"], "one query per category"
+    assert "chunk about accessibility" in prompts[0]
+    assert "second chunk" in prompts[0]
+    assert "click sign up" not in prompts[0], "retrieved chunks replace the transcript head"
+
+
+def test_without_a_retriever_the_transcript_head_is_still_used(gateway):
+    prompts = _capture_prompts(gateway)
+
+    agent = TestGeneratorAgent(model="auto")
+    assert agent.retriever is None
+    agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
+
+    assert "click sign up" in prompts[0]
+
+
+@pytest.mark.parametrize(
+    "retriever",
+    [
+        FakeRetriever(boom=RuntimeError("faiss exploded")),
+        FakeRetriever(chunks=()),
+        None,
+    ],
+    ids=["retrieval-raises", "retrieval-empty", "set_retriever(None)"],
+)
+def test_generation_degrades_to_the_transcript_head_never_crashes(gateway, retriever):
+    """setup_retrieval_chain returns None whenever no usable store exists."""
+    prompts = _capture_prompts(gateway)
+
+    agent = TestGeneratorAgent(model="auto")
+    agent.set_retriever(retriever)
+    cases = agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
+
+    assert "click sign up" in prompts[0]
+    assert cases, "a failed retrieval must not sink generation"
