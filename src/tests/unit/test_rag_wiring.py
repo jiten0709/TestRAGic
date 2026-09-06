@@ -34,8 +34,10 @@ class FakeGenerator:
 class FakeIngestion:
     def __init__(self, retriever):
         self._retriever = retriever
+        self.asked_for = "unset"
 
-    def setup_retrieval_chain(self):
+    def setup_retrieval_chain(self, store_key=None):
+        self.asked_for = store_key
         return self._retriever
 
 
@@ -71,6 +73,18 @@ def test_a_working_retriever_is_passed_through_silently(monkeypatch):
     assert warnings == [], "a healthy run must not nag"
 
 
+def test_the_run_names_the_store_it_wants(monkeypatch):
+    """Two videos have two stores; the run must not be served whichever one the
+    agent happens to hold in memory."""
+    monkeypatch.setattr("src.dashboard.app.st.warning", lambda *a, **k: None)
+
+    ingestion = FakeIngestion("a-retriever")
+    wire_retriever(FakeGenerator(), ingestion,
+                   {"vector_store_key": "demo-2", "vector_store_info": {"success": True}})
+
+    assert ingestion.asked_for == "demo-2"
+
+
 def test_a_missing_store_still_warns_without_a_reason(monkeypatch):
     """The mock path builds no store and records no error; say so anyway."""
     warnings = []
@@ -88,8 +102,8 @@ def test_a_missing_store_still_warns_without_a_reason(monkeypatch):
 def test_cold_start_load_passes_allow_dangerous_deserialization(tmp_path, monkeypatch, gateway):
     """Without the flag langchain raises, the bare except eats it, and cross-session
     store reuse is dead. Assert the flag reaches FAISS rather than the exception path."""
-    store = tmp_path / "vector_store"
-    store.mkdir()
+    store = tmp_path / "vector_store" / "demo-1"
+    store.mkdir(parents=True)
     (store / "index.faiss").write_bytes(b"")
 
     seen = {}
@@ -101,7 +115,7 @@ def test_cold_start_load_passes_allow_dangerous_deserialization(tmp_path, monkey
     monkeypatch.setattr("src.agents.data_ingestion.FAISS.load_local", staticmethod(fake_load_local))
 
     agent = DataIngestionAgent(data_dir=str(tmp_path))
-    retriever = agent.setup_retrieval_chain()
+    retriever = agent.setup_retrieval_chain("demo-1")
 
     assert seen.get("allow_dangerous_deserialization") is True
     assert retriever is not None, "a loadable store must yield a retriever"

@@ -20,7 +20,6 @@ catalog GET uses `httpx`.
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -36,7 +35,9 @@ from src.utils.config import (
     get_llm_model,
 )
 
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="utils.log")
 
 DEFAULT_GATEWAY_URL = "http://localhost:20128/v1"
 OPENAI_URL = "https://api.openai.com/v1"
@@ -376,9 +377,20 @@ def _chain(requested: str | None, candidates: list[str | None]) -> list[str]:
 # chat
 # --------------------------------------------------------------------------
 
+ENGLISH_ONLY = (
+    "You are a QA engineer. Always write every response in English, "
+    "including all JSON string values, regardless of the input language."
+)
+
+
 def chat(prompt: str, model: str | None = None, temperature: float = 0.3,
-         max_tokens: int = 4000, system: str | None = None) -> tuple[str, Attribution]:
+         max_tokens: int = 4000, system: str | None = ENGLISH_ONLY) -> tuple[str, Attribution]:
     """One chat completion, with the outer fallback chain.
+
+    `system` defaults to ENGLISH_ONLY: the gateway's `auto` route reaches
+    models that answer in their own language unless told otherwise, and a whole
+    suite came back in Chinese from an English transcript. Pass system=None to
+    opt out.
 
     Raises ProviderError only when every rung failed.
     """
@@ -417,6 +429,8 @@ def chat(prompt: str, model: str | None = None, temperature: float = 0.3,
         elif not text.strip():
             note = "model returned an empty response"
 
+        logger.info("chat ok: model=%s %dms %d chars%s", candidate, elapsed, len(text),
+                    " (after fallback)" if attempts else "")
         return text, _read_attribution(
             requested=candidate, headers=raw.headers,
             body_model=getattr(body, "model", None), gateway=ep.gateway,

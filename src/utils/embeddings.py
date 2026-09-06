@@ -15,7 +15,6 @@ reverse.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 import time
@@ -26,7 +25,9 @@ from langchain_core.embeddings import Embeddings
 from src.utils.config import get_embedding_model
 from src.utils.provider import Attribution
 
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="utils.log")
 
 DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
@@ -245,7 +246,14 @@ def read_store_meta(store_path: str | Path) -> dict | None:
         return None
 
 
-def write_store_meta(store_path: str | Path, attribution: Attribution, dimensions: int | None) -> None:
+def write_store_meta(store_path: str | Path, attribution: Attribution, dimensions: int | None,
+                     source: str | None = None, content_hash: str | None = None) -> None:
+    """Record what built this store, and what it was built from.
+
+    `source` is the human-readable origin (a URL or a file path) and `content_hash`
+    fingerprints the chunks that were embedded, so a later run can tell whether
+    re-embedding would produce anything different -- see `chunk_and_vectorize`.
+    """
     path = Path(store_path)
     path.mkdir(parents=True, exist_ok=True)
     (path / STORE_META).write_text(
@@ -253,6 +261,7 @@ def write_store_meta(store_path: str | Path, attribution: Attribution, dimension
             {"provider": attribution.provider,
              "model": attribution.model or attribution.requested_model,
              "requested_model": attribution.requested_model, "dimensions": dimensions,
+             "source": source, "content_hash": content_hash,
              "written_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
             indent=2,
         ),

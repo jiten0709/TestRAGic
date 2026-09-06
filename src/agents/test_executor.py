@@ -12,16 +12,15 @@ Configurable execution - Timeout, headless mode, recording options
 """
 
 import json
-import logging
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from playwright.sync_api import sync_playwright
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="agents.log")
 
 class TestExecutorAgent:
     def __init__(self, config_path: str = "playwright.config.js"):

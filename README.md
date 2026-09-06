@@ -160,12 +160,12 @@ git clone https://github.com/jiten0709/TestRAGic.git
 cd TestRAGic
 
 # Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On macOS/Linux
+uv venv .venv
+source .venv/bin/activate  # On macOS/Linux
 # venv\Scripts\activate  # On Windows
 
 # Install dependencies
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # Install ffmpeg (Whisper transcription of uploaded files)
 brew install ffmpeg           # macOS;  apt install ffmpeg  on Debian/Ubuntu
@@ -204,18 +204,18 @@ migration.
 
 #### Environment variables
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OMNIROUTE_BASE_URL` | _(empty)_ | Gateway endpoint. **Setting this is what selects OmniRoute mode.** |
-| `OMNIROUTE_API_KEY` | _(empty)_ | Gateway key. Optional — a local instance runs with `REQUIRE_API_KEY=false`. |
-| `OMNIROUTE_LLM_MODEL` | `auto` | Persistent default chat model. `auto`, `auto/fast`, `provider/model`, … |
-| `OMNIROUTE_TIMEOUT` | `60` | Per-request timeout in seconds; bounds the fallback chain. |
-| `TESTRAGIC_LLM_PROVIDER` | _(unset)_ | Force `omniroute` or `openai`, overriding the rule above. |
-| `OPENAI_API_KEY` | _(empty)_ | Used when no gateway is configured. |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Default model in OpenAI-direct mode. |
-| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Local embedding model (1024 dims). Changing it invalidates the vector store. |
-| `EMBEDDING_DEVICE` | _(auto)_ | `cuda`, `mps` or `cpu`. Unset picks the best accelerator present. |
-| `EMBEDDING_BATCH_SIZE` | `16` | Texts per encode batch. |
+| Variable                 | Default                     | Purpose                                                                      |
+| ------------------------ | --------------------------- | ---------------------------------------------------------------------------- |
+| `OMNIROUTE_BASE_URL`     | _(empty)_                   | Gateway endpoint. **Setting this is what selects OmniRoute mode.**           |
+| `OMNIROUTE_API_KEY`      | _(empty)_                   | Gateway key. Optional — a local instance runs with `REQUIRE_API_KEY=false`.  |
+| `OMNIROUTE_LLM_MODEL`    | `auto`                      | Persistent default chat model. `auto`, `auto/fast`, `provider/model`, …      |
+| `OMNIROUTE_TIMEOUT`      | `60`                        | Per-request timeout in seconds; bounds the fallback chain.                   |
+| `TESTRAGIC_LLM_PROVIDER` | _(unset)_                   | Force `omniroute` or `openai`, overriding the rule above.                    |
+| `OPENAI_API_KEY`         | _(empty)_                   | Used when no gateway is configured.                                          |
+| `OPENAI_MODEL`           | `gpt-4o-mini`               | Default model in OpenAI-direct mode.                                         |
+| `EMBEDDING_MODEL`        | `Qwen/Qwen3-Embedding-0.6B` | Local embedding model (1024 dims). Changing it invalidates the vector store. |
+| `EMBEDDING_DEVICE`       | _(auto)_                    | `cuda`, `mps` or `cpu`. Unset picks the best accelerator present.            |
+| `EMBEDDING_BATCH_SIZE`   | `16`                        | Texts per encode batch.                                                      |
 
 Embeddings are deliberately **not** `OMNIROUTE_*` variables: they never reach the gateway.
 
@@ -280,7 +280,7 @@ pytest -o addopts="" src/tests/generated/test_sample.py::test_basic_navigation -
    - Use `"test"` as video URL
    - Generates sample test cases instantly from a canned transcript
    - Verifies the provider path works end-to-end
-   - ⚠️ The trigger is a **substring** match: *any* URL containing "test" — including a
+   - ⚠️ The trigger is a **substring** match: _any_ URL containing "test" — including a
      real one like `youtube.com/watch?v=my-test-demo` — is silently swapped for this mock
      transcript. The app labels a mock run, but the URL you typed is ignored.
 

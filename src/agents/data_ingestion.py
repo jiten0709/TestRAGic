@@ -11,9 +11,9 @@ Data persistence - Saves processed data and vector stores
 """
 
 import json
+import re
 from pathlib import Path
 from typing import List, Dict
-import logging
 
 # Video processing imports
 from pytube import YouTube
@@ -28,9 +28,9 @@ from src.utils import embeddings as embeddings_mod
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="agents.log")
 
 def _brief(exc, limit: int = 240) -> str:
     """A one-glance reason, for showing a user.
@@ -53,6 +53,43 @@ def _brief(exc, limit: int = 240) -> str:
 # ("does not contain any stream") is exactly what it drops.
 NO_AUDIO = "no_audio"
 FFMPEG_MISSING = "ffmpeg_missing"
+
+
+DEFAULT_STORE_KEY = "default"
+
+
+def store_key_for(source: str) -> str:
+    """Directory name for one source's vectors: the YouTube id, or the file's stem.
+
+    Every ingestion used to `save_local` over the same `vector_store/` directory, so
+    the last video processed silently replaced every earlier one and no video could
+    be revisited without re-embedding it. Keying by source keeps them side by side.
+
+    Human-readable on purpose -- `vector_store/iBTWBhODSU0/`, `vector_store/demo-1/` --
+    so the directory can be inspected and deleted by hand. Identity is only *where*
+    the vectors live; whether they are still current is `content_hash` in the meta.
+    """
+    text = str(source or "").strip()
+    youtube = re.search(r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&\n?#/]+)", text)
+    if youtube:
+        return youtube.group(1)
+    if not text.lower().startswith(("http://", "https://")):
+        text = Path(text).stem
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")
+    return slug[:60] or DEFAULT_STORE_KEY
+
+
+def chunks_fingerprint(chunks: List[Dict]) -> str:
+    """Hash of exactly what would be embedded.
+
+    The honest reuse key: identical chunk text means identical vectors, so a run
+    whose fingerprint matches the stored one can skip re-embedding entirely. File
+    mtimes and sizes only approximate this.
+    """
+    import hashlib
+
+    joined = "\n".join(str(c.get("text", "")) for c in chunks)
+    return hashlib.md5(joined.encode("utf-8")).hexdigest()
 
 
 def _classify_transcript_failure(exc) -> str | None:
@@ -82,6 +119,7 @@ class DataIngestionAgent:
             expected_dimensions=store_meta.get("dimensions")
         )
         self.vector_store = None
+        self.last_store_key = DEFAULT_STORE_KEY
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -139,7 +177,9 @@ class DataIngestionAgent:
             # Step 3: Chunk and vectorize transcript
             # Pass the full transcript result to chunking
             chunks = self._intelligent_chunking(transcript_result)
-            vectorize_result = self.chunk_and_vectorize(chunks)
+            vectorize_result = self.chunk_and_vectorize(
+                chunks, store_key=store_key_for(video_url), source=video_url
+            )
             
             # Step 4: Save processed data
             output_data = {
@@ -166,6 +206,7 @@ class DataIngestionAgent:
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
+                "vector_store_key": vectorize_result.get("store_key"),
                 "output_file": str(output_file)
             }
             
@@ -626,13 +667,10 @@ class DataIngestionAgent:
         try:
             logger.info(f"Processing uploaded video file: {file_path}")
             
-            # Generate a unique video ID for the uploaded file
-            import hashlib
-            import time
-            
             file_name = Path(file_path).stem
-            timestamp = str(int(time.time()))
-            video_id = f"uploaded_{hashlib.md5((file_name + timestamp).encode()).hexdigest()[:8]}"
+            # Deterministic: the same file must yield the same id, or every re-upload
+            # writes another transcript and overwrites the previous vector store.
+            video_id = f"uploaded_{store_key_for(file_path)}"
             
             # Step 1: Create video info for uploaded file
             video_info = {
@@ -652,7 +690,9 @@ class DataIngestionAgent:
             
             # Step 3: Chunk and vectorize transcript
             chunks = self._intelligent_chunking(transcript_result)
-            vectorize_result = self.chunk_and_vectorize(chunks)
+            vectorize_result = self.chunk_and_vectorize(
+                chunks, store_key=store_key_for(file_path), source=file_path
+            )
             
             # Step 4: Save processed data
             output_data = {
@@ -679,6 +719,7 @@ class DataIngestionAgent:
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
+                "vector_store_key": vectorize_result.get("store_key"),
                 "output_file": str(output_file)
             }
             
@@ -799,8 +840,13 @@ class DataIngestionAgent:
                 "error": f"Failed to create basic transcript: {str(e)}"
             }
     
-    def chunk_and_vectorize(self, chunks: List[Dict]) -> Dict:
-        """Chunk content and create embeddings"""
+    def store_path_for(self, store_key: str | None = None) -> Path:
+        """Where one source's vectors live: src/data/vector_store/<key>/."""
+        return self.data_dir / "vector_store" / (store_key or self.last_store_key)
+
+    def chunk_and_vectorize(self, chunks: List[Dict], store_key: str | None = None,
+                            source: str | None = None) -> Dict:
+        """Embed chunks into the store for `store_key`, reusing it when unchanged."""
         try:
             # Prepare documents for vectorization
             documents = []
@@ -819,23 +865,35 @@ class DataIngestionAgent:
             
             # Create vector store
             if documents:
+                store_key = store_key or DEFAULT_STORE_KEY
+                self.last_store_key = store_key
+                vector_store_path = self.store_path_for(store_key)
+                fingerprint = chunks_fingerprint(chunks)
+
+                reused = self._reuse_store(vector_store_path, fingerprint)
+                if reused:
+                    logger.info("Reusing vectors for '%s' -- chunks unchanged", store_key)
+                    return reused
+
                 self.vector_store = FAISS.from_documents(documents, self.embeddings)
                 logger.info(f"Created vector store with {len(documents)} documents")
-                
+
                 # Save vector store
-                vector_store_path = self.data_dir / "vector_store"
-                vector_store_path.mkdir(exist_ok=True)
+                vector_store_path.mkdir(parents=True, exist_ok=True)
                 self.vector_store.save_local(str(vector_store_path))
 
                 attribution = self.embeddings.last_attribution
                 if attribution:
                     embeddings_mod.write_store_meta(
-                        vector_store_path, attribution, self.embeddings.dimensions
+                        vector_store_path, attribution, self.embeddings.dimensions,
+                        source=source, content_hash=fingerprint,
                     )
                 
                 return {
                     "success": True,
                     "documents_count": len(documents),
+                    "store_key": store_key,
+                    "reused": False,
                     "vector_store_path": str(vector_store_path),
                     "embedding_attribution": attribution.to_dict() if attribution else None,
                     "embedding_dimensions": self.embeddings.dimensions
@@ -847,11 +905,50 @@ class DataIngestionAgent:
             logger.error(f"Error in vectorization: {str(e)}")
             return {"success": False, "error": str(e)}
     
-    def setup_retrieval_chain(self):
-        """Setup RAG retrieval chain"""
+    def _reuse_store(self, vector_store_path: Path, fingerprint: str) -> Dict | None:
+        """Load an existing store instead of re-embedding, when nothing has changed.
+
+        Requires the *same* chunks (fingerprint) and the *same* embedding model and
+        width -- a store built by a different model is not interchangeable even if
+        the source text is identical.
+        """
+        stored = embeddings_mod.read_store_meta(vector_store_path) or {}
+        if not stored.get("content_hash") or stored["content_hash"] != fingerprint:
+            return None
+        if stored.get("model") != self.embeddings.model:
+            return None
+        configured = embeddings_mod.model_dimensions(self.embeddings.model)
+        if configured and stored.get("dimensions") and stored["dimensions"] != configured:
+            return None
+        try:
+            self.vector_store = FAISS.load_local(
+                str(vector_store_path), self.embeddings,
+                allow_dangerous_deserialization=True,
+            )
+        except Exception as e:
+            logger.warning("Could not reuse %s, rebuilding: %s", vector_store_path, e)
+            return None
+        return {
+            "success": True,
+            "documents_count": self.vector_store.index.ntotal,
+            "store_key": vector_store_path.name,
+            "reused": True,
+            "vector_store_path": str(vector_store_path),
+            "embedding_attribution": {
+                "provider": stored.get("provider"), "model": stored.get("model"),
+                "display": f"Reused — {stored.get('model')} ({stored.get('written_at')})",
+            },
+            "embedding_dimensions": stored.get("dimensions"),
+        }
+
+    def setup_retrieval_chain(self, store_key: str | None = None):
+        """Setup RAG retrieval chain for one source's store."""
+        if store_key and store_key != self.last_store_key:
+            self.vector_store = None  # a different video: do not serve the cached one
+            self.last_store_key = store_key
         if self.vector_store is None:
             # Try to load existing vector store
-            vector_store_path = self.data_dir / "vector_store"
+            vector_store_path = self.store_path_for(store_key)
             if vector_store_path.exists():
                 stored = embeddings_mod.read_store_meta(vector_store_path) or {}
                 configured = embeddings_mod.model_dimensions(self.embeddings.model)

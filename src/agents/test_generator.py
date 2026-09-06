@@ -12,7 +12,6 @@ Detailed logging - Comprehensive error tracking and info logging
 
 import datetime
 import json
-import logging
 import re
 from typing import Dict, List
 from langchain.prompts import ChatPromptTemplate
@@ -20,9 +19,9 @@ from pathlib import Path
 
 from src.utils import provider
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="agents.log")
 
 def _scan_json(text):
     r"""Yield every JSON array/object embedded in `text`, nesting included.

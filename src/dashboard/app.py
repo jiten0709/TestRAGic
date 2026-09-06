@@ -18,6 +18,9 @@ from src.utils import embeddings as embeddings_mod
 from src.utils import provider
 import traceback
 from src.dashboard.components.sidebar import render_sidebar
+from src.utils.logging_setup import get_logger, run_context
+
+logger = get_logger(__name__, log_file="dashboard.log")
 
 def main():
     # Load environment variables
@@ -319,6 +322,7 @@ def save_generated_tests_to_file(test_cases, video_info):
             json.dump(test_cases, f, indent=2, ensure_ascii=False)
         
         st.success(f"💾 Test cases saved to: {filename}")
+        logger.info("saved %d test cases to %s", len(test_cases.get('test_cases', [])), file_path)
         
         # Update recent generations
         if 'recent_generations' not in st.session_state:
@@ -333,6 +337,7 @@ def save_generated_tests_to_file(test_cases, video_info):
         return str(file_path)
         
     except Exception as e:
+        logger.error("could not save test cases: %s", e, exc_info=True)
         st.warning(f"Could not save test cases to file: {e}")
         return None
 
@@ -432,20 +437,24 @@ def render_test_generation_page():
                 st.error("❌ Please select at least one priority level.")
                 return
             
+            # One run id per click, tagging every line the pipeline logs across all
+            # five modules -- concurrent Streamlit sessions interleave otherwise.
             if input_method == "YouTube URL" and st.session_state.video_url:
-                generate_test_cases_from_url(
-                    st.session_state.video_url, 
-                    st.session_state.test_categories, 
-                    st.session_state.priority_levels, 
-                    st.session_state.llm_model
-                )
+                with run_context(f"url={st.session_state.video_url}"):
+                    generate_test_cases_from_url(
+                        st.session_state.video_url, 
+                        st.session_state.test_categories, 
+                        st.session_state.priority_levels, 
+                        st.session_state.llm_model
+                    )
             elif input_method == "Upload Video File" and uploaded_file:
-                generate_test_cases_from_file(
-                    uploaded_file, 
-                    st.session_state.test_categories, 
-                    st.session_state.priority_levels, 
-                    st.session_state.llm_model
-                )
+                with run_context(f"file={uploaded_file.name}"):
+                    generate_test_cases_from_file(
+                        uploaded_file, 
+                        st.session_state.test_categories, 
+                        st.session_state.priority_levels, 
+                        st.session_state.llm_model
+                    )
             else:
                 st.error("Please provide a video URL or upload a video file.")
     
@@ -532,6 +541,9 @@ def warn_if_synthetic_transcript(video_content):
         return
 
     reason = video_content.get('transcript_reason')
+    logger.warning("synthetic transcript: method=%s cause=%s reason=%s",
+                   video_content.get('transcript_method'),
+                   video_content.get('transcript_cause'), reason)
     # Switch on the code, not on the reason text: the reason is trimmed for display
     # and the decisive line is exactly what gets trimmed out.
     hint = {
@@ -562,12 +574,16 @@ def wire_retriever(test_agent, data_agent, video_content):
     just with markedly weaker prompts. Embeddings are local now, so the usual cause
     is a model that would not load or a width mismatch against the existing store.
     """
-    retriever = data_agent.setup_retrieval_chain()
+    store_key = video_content.get('vector_store_key')
+    retriever = data_agent.setup_retrieval_chain(store_key)
     test_agent.set_retriever(retriever)
     if retriever is not None:
+        logger.info("RAG on, store=%s", store_key)
         return
 
     reason = (video_content.get('vector_store_info') or {}).get('error')
+    logger.warning("RAG off, store=%s: %s -- every category prompted with transcript head",
+                   store_key, reason or "no reason reported")
     st.warning(
         "🔍 **RAG is off for this run.** No vector store was available, so every "
         "category was prompted with the first 2000 characters of the transcript "
@@ -602,6 +618,8 @@ def generate_test_cases_from_url(url, categories, priorities, model):
             return
 
         endpoint = provider.resolve_endpoint()
+        logger.info("generating from url: categories=%s priorities=%s model=%s via %s",
+                    categories, priorities, model or "default", endpoint.gateway)
         if endpoint.gateway == "openai" and endpoint.api_key:
             os.environ["OPENAI_API_KEY"] = endpoint.api_key
         
@@ -638,6 +656,7 @@ def generate_test_cases_from_url(url, categories, priorities, model):
             video_content = data_agent.process_video_content(url)
         
         if not video_content.get("success"):
+            logger.error("video processing failed: %s", video_content.get('error'))
             st.error(f"❌ Video processing failed: {video_content.get('error')}")
             return
         
@@ -660,6 +679,7 @@ def generate_test_cases_from_url(url, categories, priorities, model):
                     video_content, categories, priorities
                 )
             except Exception as e:
+                logger.warning("generate_comprehensive_tests failed: %s", e, exc_info=True)
                 st.warning(f"generate_comprehensive_tests failed: {e}")
         
         if not test_cases and hasattr(test_agent, 'generate_test_cases'):
@@ -678,6 +698,7 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         
         # If no existing method works, create a basic test case structure
         if not test_cases:
+            logger.warning("no generator method produced cases; using canned fallbacks")
             st.warning("Using fallback test generation...")
             test_cases = create_fallback_test_cases(video_content, categories, priorities)
         
@@ -716,6 +737,8 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         # Update session state
         total_cases = len(formatted_cases.get('test_cases', [])) if isinstance(formatted_cases, dict) else len(formatted_cases) if isinstance(formatted_cases, list) else 0
         
+        logger.info("generated %d test cases from url", total_cases)
+
         st.session_state.generation_stats = {
             'total_cases': total_cases,
             'core_flows': len([tc for tc in formatted_cases.get('test_cases', []) if 'core' in tc.get('category', '').lower()]),
@@ -728,6 +751,7 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         status_text.empty()
         
     except Exception as e:
+        logger.error("url generation failed: %s", e, exc_info=True)
         st.error(f"❌ Error generating test cases: {str(e)}")
         
         # Show detailed error for debugging
@@ -895,6 +919,9 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         # Step 1: Process video
         status_text.text("🎬 Processing video file...")
         progress_bar.progress(25)
+        logger.info("generating from upload: %s (%d bytes) categories=%s model=%s",
+                    uploaded_file.name, temp_file_path.stat().st_size, categories,
+                    model or "default")
         video_content = data_agent.process_video_file(str(temp_file_path))
         
         # See the URL path: retrieval-backed context, transcript head if unavailable.
@@ -918,12 +945,15 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         progress_bar.progress(100)
         
         # Show results
+        logger.info("generated %d test cases from upload",
+                    len(formatted_cases.get('test_cases', [])) if isinstance(formatted_cases, dict) else 0)
         display_generated_test_cases(formatted_cases)
         
         # Cleanup
         temp_file_path.unlink()
         
     except Exception as e:
+        logger.error("upload generation failed: %s", e, exc_info=True)
         st.error(f"Error generating test cases: {str(e)}")
         progress_bar.empty()
         status_text.empty()
@@ -1216,8 +1246,11 @@ def execute_playwright_tests(selected_files, browsers, headless, parallel_execut
             all_test_cases.extend(test_cases)
         
         if not all_test_cases:
+            logger.error("execution aborted: no test cases in %s", selected_files)
             st.error("No test cases found in selected files")
             return
+
+        logger.info("executing %d test cases on %s (simulated)", len(all_test_cases), browsers)
         
         # Calculate total tests: test cases × browsers
         total_tests = len(all_test_cases) * len(browsers)
@@ -1305,6 +1338,7 @@ def execute_playwright_tests(selected_files, browsers, headless, parallel_execut
         }, selected_files)
         
         # Show summary
+        logger.info("execution finished: %d passed, %d failed of %d runs", passed, failed, executed)
         if failed > 0:
             st.warning(f"Test execution completed: {passed} passed, {failed} failed")
         else:
@@ -1314,6 +1348,7 @@ def execute_playwright_tests(selected_files, browsers, headless, parallel_execut
         st.info(f"Executed {len(all_test_cases)} test cases across {len(browsers)} browsers = {executed} total test runs")
         
     except Exception as e:
+        logger.error("test execution failed: %s", e, exc_info=True)
         st.error(f"Error executing tests: {str(e)}")
         progress_bar.empty()
         status_text.empty()
@@ -1606,28 +1641,39 @@ def render_ai_provider_settings():
 
 
 def render_vector_store_settings():
-    """Vector width is a correctness constraint: mixing widths corrupts the store."""
-    store_path = Path("src/data/vector_store")
-    stored = embeddings_mod.read_store_meta(store_path)
-    if not stored:
+    """One store per source, listed. Vector width is a correctness constraint:
+    mixing widths corrupts a store, so a stale-width one is called out per row."""
+    root = Path("src/data/vector_store")
+    stores = sorted(
+        (d for d in root.glob("*") if d.is_dir() and embeddings_mod.read_store_meta(d)),
+        key=lambda d: d.name,
+    )
+    if not stores:
         return
 
-    with st.expander("🗂️ Vector store", expanded=False):
-        st.caption(
-            f"Built with {provider.pretty(stored.get('provider'), stored.get('model'))}"
-            f" — {stored.get('dimensions')} dims, {stored.get('written_at', 'unknown date')}"
-        )
-        configured = embeddings_mod.model_dimensions(embeddings_mod.default_model())
-        if configured and stored.get('dimensions') and configured != stored['dimensions']:
-            st.error(
-                f"⚠️ The selected embedding model produces {configured}-dim vectors but this "
-                f"store is {stored['dimensions']}-dim. Vectors of different widths are not "
-                "comparable — the store must be cleared before re-ingesting."
+    configured = embeddings_mod.model_dimensions(embeddings_mod.default_model())
+    with st.expander(f"🗂️ Vector stores ({len(stores)})", expanded=False):
+        st.caption("One store per video, keyed by YouTube id or file name. "
+                   "Re-ingesting the same source reuses its vectors unless the "
+                   "transcript changed.")
+        for store in stores:
+            stored = embeddings_mod.read_store_meta(store) or {}
+            st.markdown(f"**`{store.name}`** — {stored.get('source') or 'unknown source'}")
+            st.caption(
+                f"{provider.pretty(stored.get('provider'), stored.get('model'))}"
+                f" — {stored.get('dimensions')} dims, {stored.get('written_at', 'unknown date')}"
             )
-            if st.button("🗑️ Clear vector store"):
-                for item in store_path.glob("*"):
+            if configured and stored.get('dimensions') and configured != stored['dimensions']:
+                st.error(
+                    f"⚠️ The selected embedding model produces {configured}-dim vectors but "
+                    f"this store is {stored['dimensions']}-dim. Vectors of different widths "
+                    "are not comparable — clear it before re-ingesting."
+                )
+            if st.button("🗑️ Clear", key=f"clear_store_{store.name}"):
+                for item in store.glob("*"):
                     item.unlink()
-                st.success("✅ Vector store cleared. Re-ingest to rebuild it.")
+                store.rmdir()
+                st.success(f"✅ Cleared `{store.name}`. Re-ingest to rebuild it.")
                 st.rerun()
 
 
@@ -1821,6 +1867,8 @@ def test_llm_connection(model=None):
     ok, attribution, error = provider.test_connection(model)
 
     if not ok:
+        logger.error("provider ping failed via %s at %s: %s",
+                     endpoint.gateway, endpoint.base_url, error)
         st.error(f"❌ Connection failed via {endpoint.gateway} at {endpoint.base_url}")
         st.caption(error or "no detail reported")
         if endpoint.gateway == "omniroute":

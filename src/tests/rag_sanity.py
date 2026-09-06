@@ -9,7 +9,8 @@ Exercises the real pipeline classes, not a parallel reimplementation:
     3. generate -- provider.chat over the retrieved chunks, through OmniRoute
 
 Exits non-zero on the first stage that fails, so it works as a smoke gate. It
-writes to src/data/vector_store/, which the app overwrites on every ingestion.
+writes to src/data/vector_store/rag-sanity/, its own keyed store, so it never
+disturbs a real video's vectors.
 """
 
 import sys
@@ -51,12 +52,16 @@ def main() -> int:
     agent = DataIngestionAgent()
     print(f"1. embedding with {agent.embeddings.model} "
           f"(requested device {agent.embeddings.device})")
-    result = agent.chunk_and_vectorize([chunk(i, t) for i, t in enumerate(CHUNKS)])
+    result = agent.chunk_and_vectorize(
+        [chunk(i, t) for i, t in enumerate(CHUNKS)],
+        store_key="rag-sanity", source="src/tests/rag_sanity.py",
+    )
     if not result.get("success"):
         print(f"   FAIL: {result.get('error')}")
         return 1
     print(f"   OK: {result['documents_count']} chunks -> {result['embedding_dimensions']} dims, "
-          f"{(result.get('embedding_attribution') or {}).get('display')}")
+          f"{(result.get('embedding_attribution') or {}).get('display')}"
+          f"{' [reused]' if result.get('reused') else ''}")
 
     meta = embeddings_mod.read_store_meta(Path(result["vector_store_path"]))
     print(f"   store meta: {meta}")
@@ -65,7 +70,7 @@ def main() -> int:
     # Drop the in-memory store so the disk reload path is what gets exercised;
     # that branch silently returned None for the whole life of the project.
     agent.vector_store = None
-    retriever = agent.setup_retrieval_chain()
+    retriever = agent.setup_retrieval_chain("rag-sanity")
     if retriever is None:
         print("   FAIL: no retriever -- the store did not reload from disk")
         return 1

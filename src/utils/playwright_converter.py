@@ -12,14 +12,13 @@ File Management - Saves tests to organized directory structure
 """
 
 import re
-import logging
 from typing import Dict, List, Tuple
 from pathlib import Path
 from datetime import datetime
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="utils.log")
 
 # Global constants
 DEFAULT_TIMEOUT = 30000  # 30 seconds

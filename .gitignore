@@ -228,3 +228,6 @@ CLAUDE.md
 ruvector.db 
 agentdb.rvf
 agentdb.rvf.lock
+
+# Application logs — they leak transcript content, keep them local
+logs/

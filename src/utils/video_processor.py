@@ -1,6 +1,5 @@
 import re
 import json
-import logging
 from typing import Dict, List
 from pathlib import Path
 from pytube import YouTube
@@ -28,9 +27,9 @@ try:
 except Exception as e:
     print(f"Warning: NLTK setup failed: {e}")
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.utils.logging_setup import get_logger
+
+logger = get_logger(__name__, log_file="utils.log")
 
 class VideoProcessor:
     def __init__(self):
