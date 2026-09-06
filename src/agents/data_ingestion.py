@@ -797,9 +797,16 @@ class DataIngestionAgent:
                     )
                     return None
                 try:
+                    # langchain-community 0.3.27 requires this opt-in. Without it
+                    # every cold-start load raised, the except below swallowed it,
+                    # and a store was never reused across sessions.
+                    # ponytail: trusts src/data/vector_store/ (pickle). It is written
+                    # by this app into a gitignored local dir; if a store ever arrives
+                    # from anywhere else, move the index to a non-pickle format.
                     self.vector_store = FAISS.load_local(
-                        str(vector_store_path), 
-                        self.embeddings
+                        str(vector_store_path),
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
                     )
                     logger.info("Loaded existing vector store")
                 except Exception as e:

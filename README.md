@@ -229,20 +229,32 @@ streamlit run run_app.py
 ### 3. Verify Installation
 
 ```bash
-# Test Playwright setup
-pytest src/tests/generated/test_sample.py -v
-
-# Verify all dependencies
+# Verify all dependencies. `openai` is the HTTP transport for the OpenAI-compatible
+# endpoint OmniRoute exposes — it is not a second provider path.
 python -c "import streamlit, playwright, openai, langchain; print('✅ All dependencies installed!')"
 
-# Provider unit tests (no network, no browser)
-pytest src/tests/unit -o addopts="" -q
+# Provider unit tests — pure Python, no network, no browser. ~8s.
+pytest src/tests/unit -o addopts="" -q          # expect: 96 passed, 1 skipped
 
 # Live smoke test against a running OmniRoute gateway.
 # Skipped automatically when no gateway is reachable.
+#   5 passed            → chat AND embeddings both work
+#   4 passed, 1 skipped → chat works, gateway cannot embed (RAG will not run)
 OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
   pytest src/tests/unit/test_live_omniroute.py -o addopts="" -q -s
+
+# One real query end to end, printing which provider actually answered.
+python src/tests/omniroute_test.py
+
+# Playwright setup, one browser at a time.
+pytest -o addopts="" src/tests/generated/test_sample.py::test_basic_navigation --browser chromium -q
 ```
+
+> ⚠️ **Do not run bare `pytest` yet.** `pytest.ini` forces `--headed` across chromium,
+> firefox and webkit; the run hangs after the first browser and never returns.
+> `test_search_functionality` also fails independently — it drives google.com, whose
+> consent page means the search box never appears and whose `networkidle` wait never
+> settles. Both are pre-existing scaffolding issues, unrelated to the provider layer.
 
 ### 4. First Test Run
 
@@ -254,8 +266,11 @@ OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
 
 2. **Try Mock Data** (recommended first)
    - Use `"test"` as video URL
-   - Generates sample test cases instantly
-   - Verifies system works end-to-end
+   - Generates sample test cases instantly from a canned transcript
+   - Verifies the provider path works end-to-end
+   - ⚠️ The trigger is a **substring** match: *any* URL containing "test" — including a
+     real one like `youtube.com/watch?v=my-test-demo` — is silently swapped for this mock
+     transcript. The app labels a mock run, but the URL you typed is ignored.
 
 3. **Upload Your Video**
    - Local file: MP4, AVI, MOV, MKV, WebM
@@ -299,13 +314,30 @@ OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
 
 - Data Ingestion Agent (YouTube + transcript extraction)
 - File Upload Support (MP4, AVI, MOV, MKV, WebM)
-- AI-Powered Test Generation with RAG
-- Streamlit Dashboard (multi-page interface)
-- Playwright Test Execution Framework
-- Vector Storage (FAISS)
-- Mock Data Testing
-- Multi-format Exports (JSON, Markdown)
-- Multiple Input Methods (files, URLs, links)
+- AI-powered test generation, every call routed through OmniRoute
+- Per-call attribution — each test case records which provider and model actually served it
+- Bounded model fallback chain (requested → app default → `auto`)
+- Streamlit dashboard (single-page router in `src/dashboard/app.py`)
+- Vector storage (FAISS) with an enforced embedding-width guard
+- Mock data testing
+- Multi-format exports (JSON, Markdown)
+
+### Conditional ⚠️
+
+- **RAG retrieval** — wired on both generation paths, but it needs a gateway that can
+  actually embed. OmniRoute only serves embeddings for providers it holds credentials
+  for; an instance wired to chat-only providers answers `GET /v1/embeddings` with
+  `data: []` and rejects embedding requests with `400`. When that happens the app falls
+  back to the first 2000 characters of the transcript for every category **and now says
+  so** in a warning on the generation page. Check Settings → AI Provider: a warning above
+  the embedding-model dropdown means RAG will not run.
+
+### Simulated 🧪
+
+- **Test execution.** `app.py::execute_playwright_tests` loops over test cases with
+  `time.sleep(0.3)` and a weighted random pass/fail. **No browser is launched.** Real
+  Playwright execution exists in `TestExecutorAgent` / `PlaywrightConverter` but is not
+  wired into the dashboard. Results and analytics are therefore built from simulated runs.
 
 ---
 
@@ -319,9 +351,13 @@ OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
 
 ### Q3 2026
 
-- Claude & Gemini LLM integration
+- Wire `TestExecutorAgent` + `PlaywrightConverter` into the dashboard so execution is
+  real rather than simulated (needs the test-case key casing reconciled first)
 - CI/CD integration (GitHub Actions, Jenkins)
 - Mobile app testing (React Native, Flutter)
+
+> Multi-provider LLM support (Claude, Gemini, and ~350 others) is **already done** — it
+> arrived with the OmniRoute migration and needs no per-provider work here.
 
 ### Q4 2026
 
@@ -361,6 +397,38 @@ curl -i http://localhost:20128/v1/models      # should return 200 + X-OmniRoute-
 # NOTE: there is no API key *format* check any more. A gateway key is whatever
 # its operator chose, and a local OmniRoute instance is keyless by default.
 ```
+
+### ❌ "RAG is off for this run" / weak, repetitive test cases
+
+The most common cause is a gateway with **no embedding-provider credentials**. OmniRoute
+only serves embeddings for providers it holds keys for; a chat-only instance answers
+`GET /v1/embeddings` with `data: []` and rejects every embedding request with
+`400 "No credentials for embedding provider"`. No embeddings means no vector store, no
+retriever, and every test category prompted with the same opening 2000 characters of the
+transcript.
+
+```bash
+# 1. Does the gateway list any embedding models?
+curl -s http://localhost:20128/v1/embeddings | python -m json.tool | head
+#    data: []  →  RAG cannot run.
+
+# 2. Will it actually embed?
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:20128/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/text-embedding-3-small","input":"hello"}'
+#    200 = good.  400 = no credentials for that provider.
+
+# 3. Fix: open http://localhost:20128 and connect a provider that offers embeddings,
+#    then pick its model in Settings → AI Provider.
+```
+
+Signals in the UI: a warning above the embedding-model dropdown in Settings means the
+list is static, not live. A warning on the generation page means RAG was off for that
+specific run.
+
+**Changing the embedding model changes the vector width**, and vectors of different
+widths are not comparable. The app refuses to mix them rather than silently corrupting
+the index — clear `src/data/vector_store/` (Settings has a button) and re-ingest.
 
 ### ❌ YouTube Download Failures
 

@@ -512,6 +512,31 @@ def render_test_generation_page():
             st.success("✅ Session data cleared!")
             st.rerun()
 
+def wire_retriever(test_agent, data_agent, video_content):
+    """Hand this run's vector store to the generator, and say so when there isn't one.
+
+    Both generation paths route through here because the failure is otherwise
+    invisible: no store means no retriever, the generator silently falls back to
+    `transcript[:2000]` for every category, and the run still reports success --
+    just with markedly weaker prompts. A gateway holding no embedding-provider
+    credentials (OmniRoute answers those 400) hits this on every run.
+    """
+    retriever = data_agent.setup_retrieval_chain()
+    test_agent.set_retriever(retriever)
+    if retriever is not None:
+        return
+
+    reason = (video_content.get('vector_store_info') or {}).get('error')
+    st.warning(
+        "🔍 **RAG is off for this run.** No vector store was available, so every "
+        "category was prompted with the first 2000 characters of the transcript "
+        "instead of chunks retrieved for it."
+        + (f"\n\nReason: `{reason}`" if reason else "")
+        + "\n\nCheck Settings → AI Provider: if the embedding model list shows a "
+        "warning, the gateway holds no embedding credentials and RAG cannot run."
+    )
+
+
 def generate_test_cases_from_url(url, categories, priorities, model):
     """Generate test cases from YouTube URL"""
     progress_bar = st.progress(0)
@@ -576,9 +601,9 @@ def generate_test_cases_from_url(url, categories, priorities, model):
             return
         
         # Feed the freshly-built vector store to the generator so each category is
-        # prompted with chunks relevant to it. Returns None on the mock path (no
-        # store was built) and the generator falls back to the transcript head.
-        test_agent.set_retriever(data_agent.setup_retrieval_chain())
+        # prompted with chunks relevant to it. Warns when there is no store (the
+        # mock path, or a gateway that cannot embed) rather than degrading quietly.
+        wire_retriever(test_agent, data_agent, video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -831,7 +856,7 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         video_content = data_agent.process_video_file(str(temp_file_path))
         
         # See the URL path: retrieval-backed context, transcript head if unavailable.
-        test_agent.set_retriever(data_agent.setup_retrieval_chain())
+        wire_retriever(test_agent, data_agent, video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")

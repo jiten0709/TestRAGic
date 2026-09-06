@@ -151,8 +151,10 @@ Focus on:
 - Mobile performance"""
 
 class TestGeneratorAgent:
-    def __init__(self, model="gpt-4o-mini"):
+    def __init__(self, model=None):
         """Initialize Test Generator Agent"""
+        # Default through the provider, not a hardcoded OpenAI id: in omniroute
+        # mode that id is a model the gateway may hold no credentials for.
         self.model = model or provider.default_chat_model()
 
         # No client is constructed here: every call goes through src/utils/provider.py,
