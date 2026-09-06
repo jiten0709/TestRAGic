@@ -23,7 +23,7 @@ import whisper
 # LangChain imports
 from langchain_community.vectorstores import FAISS
 
-from src.utils import provider
+from src.utils import embeddings as embeddings_mod
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
@@ -31,6 +31,38 @@ from langchain.schema import Document
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def _brief(exc, limit: int = 240) -> str:
+    """A one-glance reason, for showing a user.
+
+    ffmpeg fails by printing its whole build banner and putting the real message on
+    the last line, so a naive str(exc) buries the cause under 25 lines of configure
+    flags. Keep the first line (what failed) and the last two (why). The untrimmed
+    text is still in the log -- every caller logs it before calling this.
+    """
+    lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    kept = lines if len(lines) <= 3 else [lines[0], "...", *lines[-2:]]
+    brief = " ".join(kept)
+    return brief if len(brief) <= limit else brief[:limit - 1] + "…"
+
+
+# Why transcription fell back, as a stable code. Classified against the *full*
+# exception text: _brief() trims the middle out for display, and the decisive line
+# ("does not contain any stream") is exactly what it drops.
+NO_AUDIO = "no_audio"
+FFMPEG_MISSING = "ffmpeg_missing"
+
+
+def _classify_transcript_failure(exc) -> str | None:
+    text = str(exc)
+    if "does not contain any stream" in text or "Output file #0 does not contain" in text:
+        return NO_AUDIO
+    if "No such file or directory: 'ffmpeg'" in text or "ffmpeg not found" in text:
+        return FFMPEG_MISSING
+    return None
+
 
 class DataIngestionAgent:
     def __init__(self, data_dir: str = "src/data"):
@@ -42,11 +74,11 @@ class DataIngestionAgent:
         # Create directories
         self._create_directories()
         
-        # Initialize components. Embeddings go through src/utils/provider.py, which
-        # exposes the same LangChain interface FAISS expects. An existing store pins
-        # the vector width -- mixing widths would corrupt it, so pass it through.
-        store_meta = provider.read_store_meta(self.data_dir / "vector_store") or {}
-        self.embeddings = provider.OmniRouteEmbeddings(
+        # Vectors are produced in-process by a local model (src/utils/embeddings.py);
+        # the gateway serves chat only. An existing store pins the vector width --
+        # mixing widths would corrupt it, so pass it through.
+        store_meta = embeddings_mod.read_store_meta(self.data_dir / "vector_store") or {}
+        self.embeddings = embeddings_mod.Qwen3Embeddings(
             expected_dimensions=store_meta.get("dimensions")
         )
         self.vector_store = None
@@ -113,6 +145,9 @@ class DataIngestionAgent:
             output_data = {
                 "video_info": download_result,
                 "transcript": transcript_result.get("transcript", ""),
+                "transcript_method": transcript_result.get("method"),
+                "transcript_reason": transcript_result.get("reason"),
+                "transcript_cause": transcript_result.get("cause"),
                 "chunks": chunks,
                 "vector_store_info": vectorize_result
             }
@@ -125,6 +160,9 @@ class DataIngestionAgent:
                 "video_id": video_id,
                 "video_info": download_result,
                 "transcript": transcript_result.get("transcript", ""),
+                "transcript_method": transcript_result.get("method"),
+                "transcript_reason": transcript_result.get("reason"),
+                "transcript_cause": transcript_result.get("cause"),
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
@@ -288,14 +326,21 @@ class DataIngestionAgent:
     def _extract_transcript(self, video_id: str, video_path: str = None) -> Dict:
         """Extract transcript with fallback methods"""
         try:
+            # Why each real method failed, so the synthetic fallback can say so
+            # instead of being indistinguishable from a genuine transcript.
+            reasons = []
+            cause = None
+
             # Method 1: Try YouTube transcript API first
             try:
                 logger.info("Attempting to get transcript from YouTube API...")
                 transcript_data = self._get_youtube_transcript(video_id)
                 if transcript_data["success"]:
                     return transcript_data
+                reasons.append(f"YouTube captions: {_brief(transcript_data.get('error', 'unavailable'))}")
             except Exception as e:
                 logger.warning(f"YouTube transcript API failed: {e}")
+                reasons.append(f"YouTube captions: {_brief(e)}")
             
             # Method 2: Try Whisper if video file exists
             if video_path and Path(video_path).exists():
@@ -304,10 +349,14 @@ class DataIngestionAgent:
                     return self._get_whisper_transcript(video_path)
                 except Exception as e:
                     logger.warning(f"Whisper transcription failed: {e}")
+                    reasons.append(f"Whisper: {_brief(e)}")
+                    cause = cause or _classify_transcript_failure(e)
+            else:
+                reasons.append("Whisper: the video could not be downloaded")
             
             # Method 3: Create basic transcript from video metadata
             logger.info("Creating basic transcript from available data...")
-            return self._create_basic_transcript(video_id)
+            return self._create_basic_transcript(video_id, "; ".join(reasons), cause)
             
         except Exception as e:
             logger.error(f"All transcript methods failed: {str(e)}")
@@ -407,7 +456,7 @@ class DataIngestionAgent:
             logger.error(f"Whisper transcription error: {str(e)}")
             raise Exception(f"Whisper model not available: {str(e)}")
 
-    def _create_basic_transcript(self, video_id: str) -> Dict:
+    def _create_basic_transcript(self, video_id: str, reason: str = "", cause: str | None = None) -> Dict:
         """Create a basic transcript when other methods fail"""
         try:
             basic_transcript = f"""
@@ -436,7 +485,9 @@ class DataIngestionAgent:
                 "success": True,
                 "transcript": basic_transcript.strip(),
                 "segments": [{"text": basic_transcript.strip(), "start": 0, "end": 120}],
-                "method": "basic_fallback"
+                "method": "basic_fallback",
+                "reason": reason,
+                "cause": cause
             }
         except Exception as e:
             logger.error(f"Error creating basic transcript: {e}")
@@ -607,6 +658,9 @@ class DataIngestionAgent:
             output_data = {
                 "video_info": video_info,
                 "transcript": transcript_result.get("transcript", ""),
+                "transcript_method": transcript_result.get("method"),
+                "transcript_reason": transcript_result.get("reason"),
+                "transcript_cause": transcript_result.get("cause"),
                 "chunks": chunks,
                 "vector_store_info": vectorize_result
             }
@@ -619,6 +673,9 @@ class DataIngestionAgent:
                 "video_id": video_id,
                 "video_info": video_info,
                 "transcript": transcript_result.get("transcript", ""),
+                "transcript_method": transcript_result.get("method"),
+                "transcript_reason": transcript_result.get("reason"),
+                "transcript_cause": transcript_result.get("cause"),
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
@@ -635,15 +692,17 @@ class DataIngestionAgent:
         """Extract transcript from uploaded video file"""
         try:
             # Method 1: Try Whisper transcription
+            reason, cause = "", None
             try:
                 logger.info(f"Attempting Whisper transcription for uploaded file: {file_path}")
                 return self._get_whisper_transcript_direct(file_path)
             except Exception as e:
                 logger.warning(f"Whisper transcription failed: {e}")
+                reason, cause = _brief(e), _classify_transcript_failure(e)
             
             # Method 2: Create basic transcript based on file
             logger.info("Creating basic transcript for uploaded video...")
-            return self._create_basic_transcript_for_file(file_path)
+            return self._create_basic_transcript_for_file(file_path, reason, cause)
             
         except Exception as e:
             logger.error(f"All transcript methods failed for uploaded file: {str(e)}")
@@ -689,8 +748,15 @@ class DataIngestionAgent:
             logger.error(f"Direct Whisper transcription error: {str(e)}")
             raise Exception(f"Whisper transcription failed: {str(e)}")
 
-    def _create_basic_transcript_for_file(self, file_path: str) -> Dict:
-        """Create a basic transcript for uploaded video file when other methods fail"""
+    def _create_basic_transcript_for_file(self, file_path: str, reason: str = "",
+                                          cause: str | None = None) -> Dict:
+        """Create a basic transcript for uploaded video file when other methods fail.
+
+        The text below is a fixed placeholder: it knows the filename and nothing else
+        about the video. Downstream it is indistinguishable from a real transcript, so
+        `method` and `reason` travel with it and `app.py::warn_if_synthetic_transcript`
+        surfaces them -- otherwise a silent video yields confident, unrelated tests.
+        """
         try:
             file_name = Path(file_path).name
             
@@ -721,7 +787,9 @@ class DataIngestionAgent:
                 "success": True,
                 "transcript": basic_transcript.strip(),
                 "segments": [{"text": basic_transcript.strip(), "start": 0, "end": 180}],
-                "method": "basic_fallback_file"
+                "method": "basic_fallback_file",
+                "reason": reason,
+                "cause": cause
             }
             
         except Exception as e:
@@ -761,7 +829,7 @@ class DataIngestionAgent:
 
                 attribution = self.embeddings.last_attribution
                 if attribution:
-                    provider.write_store_meta(
+                    embeddings_mod.write_store_meta(
                         vector_store_path, attribution, self.embeddings.dimensions
                     )
                 
@@ -785,8 +853,8 @@ class DataIngestionAgent:
             # Try to load existing vector store
             vector_store_path = self.data_dir / "vector_store"
             if vector_store_path.exists():
-                stored = provider.read_store_meta(vector_store_path) or {}
-                configured = provider.model_dimensions(self.embeddings.model)
+                stored = embeddings_mod.read_store_meta(vector_store_path) or {}
+                configured = embeddings_mod.model_dimensions(self.embeddings.model)
                 if stored.get("dimensions") and configured and stored["dimensions"] != configured:
                     logger.error(
                         "Vector store was built with %s (%s dims) but %s produces %s dims. "

@@ -48,12 +48,15 @@ def set_llm_model(model: str):
     os.environ["OMNIROUTE_LLM_MODEL"] = model
 
 def get_embedding_model():
-    """Embedding model override: session state, then $OMNIROUTE_EMBEDDING_MODEL."""
-    return _session_get('embedding_model') or os.getenv('OMNIROUTE_EMBEDDING_MODEL')
+    """Local embedding model override: session state, then $EMBEDDING_MODEL.
+
+    Not an OMNIROUTE_* variable: embeddings never touch the gateway. See
+    src/utils/embeddings.py."""
+    return _session_get('embedding_model') or os.getenv('EMBEDDING_MODEL')
 
 def set_embedding_model(model: str):
     _session_set('embedding_model', model)
-    os.environ["OMNIROUTE_EMBEDDING_MODEL"] = model
+    os.environ["EMBEDDING_MODEL"] = model
 
 def get_gateway_base_url():
     """OmniRoute gateway URL. Its presence is what selects OmniRoute mode."""

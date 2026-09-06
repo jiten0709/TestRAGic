@@ -161,7 +161,12 @@ def test_each_category_queries_the_retriever_and_its_chunks_reach_the_prompt(gat
     agent.set_retriever(retriever)
     agent.generate_comprehensive_tests(VIDEO, ["ui", "accessibility"], ["high"])
 
-    assert retriever.queries == ["ui", "accessibility"], "one query per category"
+    assert len(retriever.queries) == 2, "one query per category"
+    assert [q.split(":")[0] for q in retriever.queries] == ["ui", "accessibility"]
+    assert all(len(q) > 40 for q in retriever.queries), (
+        "a bare label is too weak a query to retrieve on -- see "
+        "TestGeneratorAgent._retrieval_query"
+    )
     assert "chunk about accessibility" in prompts[0]
     assert "second chunk" in prompts[0]
     assert "click sign up" not in prompts[0], "retrieved chunks replace the transcript head"

@@ -93,48 +93,6 @@ def test_unreachable_catalog_degrades_with_a_warning(gateway):
     assert "auto" in [m["id"] for m in models]
 
 
-def test_embedding_catalog_parses_with_dimensions(gateway):
-    models, warning = provider.list_embedding_models()
-    by_id = {m["id"]: m for m in models}
-
-    assert warning is None
-    assert by_id["openai/text-embedding-3-small"]["dimensions"] == 1536
-    assert by_id["openai/text-embedding-3-large"]["dimensions"] == 3072
-
-
-def test_embedding_catalog_404_in_openai_mode_is_not_a_warning(openai_direct):
-    """OpenAI has no GET /v1/embeddings; the static list there is complete, not stale."""
-    openai_direct.embedding_catalog_status = 404
-    models, warning = provider.list_embedding_models()
-
-    assert warning is None
-    assert "text-embedding-3-small" in [m["id"] for m in models]
-
-
-def test_embedding_catalog_404_on_the_gateway_does_warn(gateway):
-    gateway.embedding_catalog_status = 404
-    models, warning = provider.list_embedding_models()
-    assert models and warning
-
-
-def test_an_empty_embedding_catalog_warns_instead_of_emptying_the_dropdown(gateway):
-    """A real OmniRoute instance holding no embedding-provider credentials answers
-    200 with data:[]. That used to return ([], None): an empty Settings dropdown and
-    nothing saying why."""
-    gateway.embedding_catalog = []
-    models, warning = provider.list_embedding_models()
-
-    assert models, "never present an empty dropdown"
-    assert warning and "no embedding models" in warning
-    assert "RAG stays off" in warning, "the consequence must be stated, not just the fact"
-
-
-def test_model_dimensions_falls_back_to_the_static_map():
-    assert provider.model_dimensions("text-embedding-3-small") == 1536
-    assert provider.model_dimensions("openai/text-embedding-3-large") == 3072
-    assert provider.model_dimensions("some/unknown-model") is None
-
-
 # --------------------------------------------------------------------------
 # defaults
 # --------------------------------------------------------------------------
@@ -153,13 +111,6 @@ def test_default_chat_model_in_openai_mode(monkeypatch):
 
     monkeypatch.setenv("OPENAI_MODEL", "gpt-4o")
     assert provider.default_chat_model() == "gpt-4o"
-
-
-def test_default_embedding_model_is_1536_dims(monkeypatch):
-    """Matches the existing on-disk index, so continuity is preserved."""
-    monkeypatch.setenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1")
-    assert provider.default_embedding_model() == "openai/text-embedding-3-small"
-    assert provider.model_dimensions(provider.default_embedding_model()) == 1536
 
 
 def test_openai_direct_strips_the_provider_prefix(monkeypatch):

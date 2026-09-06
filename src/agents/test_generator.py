@@ -13,6 +13,7 @@ Detailed logging - Comprehensive error tracking and info logging
 import datetime
 import json
 import logging
+import re
 from typing import Dict, List
 from langchain.prompts import ChatPromptTemplate
 from pathlib import Path
@@ -268,18 +269,34 @@ class TestGeneratorAgent:
         self.retriever = retriever
         logger.info("Retriever set for context-aware test generation")
 
-    def _context_for(self, category, transcript):
+    @staticmethod
+    def _retrieval_query(category, template=None):
+        """What to actually ask the vector store for.
+
+        A bare category label is a poor query: measured against a 4-chunk corpus,
+        "authentication" separated the login chunk from an unrelated one by 0.002
+        cosine, while a phrased query separated them by 0.29. Qwen3 embeds queries
+        under a "retrieve passages that answer this" instruction, so it needs a
+        question's worth of content, not a heading.
+
+        Each template already lists five concrete topics for its category; those
+        numbered lines are the description the label is missing.
+        """
+        focus = re.findall(r"^\s*\d+\.\s*(.+?)\s*$", template or "", re.M)
+        return f"{category}: {', '.join(focus)}" if focus else category
+
+    def _context_for(self, category, transcript, template=None):
         """Source material for one category's prompt.
 
         Without a retriever every category gets `transcript[:2000]` -- the same
         first ~2000 *characters* of the video, so accessibility tests are written
         from whatever was said in the opening ninety seconds. Retrieval queries the
-        vector store with the category name instead, which is also what makes the
-        chosen embedding model affect the output at all.
+        vector store instead, which is also what makes the chosen embedding model
+        affect the output at all.
         """
         if self.retriever:
             try:
-                docs = self.retriever.invoke(category)
+                docs = self.retriever.invoke(self._retrieval_query(category, template))
                 chunks = "\n\n".join(d.page_content for d in docs)
                 if chunks.strip():
                     return chunks
@@ -540,7 +557,7 @@ class TestGeneratorAgent:
             for category in categories:
                 # Generate test cases for each category
                 template = self.templates.get(category.lower().replace(' ', '_'), self.templates['functional'])
-                context = self._context_for(category, transcript)
+                context = self._context_for(category, transcript, template)
 
                 prompt = f"""
                 Based on the following video content, generate test cases for {category}:

@@ -1,7 +1,10 @@
-"""Single LLM/embedding provider abstraction for TestRAGic.
+"""Single LLM gateway client for TestRAGic.
 
-Every chat completion and every embedding in this app goes through this module.
-Nothing else imports `openai`, `langchain_openai`, or any provider SDK.
+Every chat completion in this app goes through this module. Nothing else imports
+`openai`, `langchain_openai`, or any provider SDK.
+
+Embeddings are NOT here: this gateway serves chat only, so vectors are produced
+in-process by a local model -- see `src/utils/embeddings.py`.
 
 Two modes, resolved by :func:`resolve_endpoint`:
 
@@ -11,26 +14,22 @@ Two modes, resolved by :func:`resolve_endpoint`:
   ``X-OmniRoute-*`` response headers.
 * ``openai``    -- no gateway configured: plain OpenAI, exactly as before.
 
-Transport is the already-installed `openai` SDK pointed at ``base_url``; the two
-catalog GETs use `httpx`. No new dependencies.
+Transport is the already-installed `openai` SDK pointed at ``base_url``; the model
+catalog GET uses `httpx`.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
 import openai
-from langchain_core.embeddings import Embeddings
 
 from src.utils.config import (
-    get_embedding_model,
     get_gateway_api_key,
     get_gateway_base_url,
     get_llm_api_key,
@@ -52,14 +51,6 @@ CATALOG_TTL = 300.0
 AUTO_VARIANTS = ["auto", "auto/coding", "auto/fast", "auto/cheap", "auto/smart"]
 STATIC_OPENAI_CHAT = ["gpt-4o-mini", "gpt-4o", "gpt-4.1"]
 
-# Only used when the gateway does not report dimensions itself. Vectors of
-# different dimensions are not comparable -- see EmbeddingDimensionMismatch.
-KNOWN_DIMENSIONS = {
-    "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 3072,
-    "text-embedding-ada-002": 1536,
-}
-
 # Injected by tests (httpx.MockTransport). When set, both the OpenAI SDK and the
 # catalog GETs run through it, so the real header-parsing path is exercised.
 http_client: httpx.Client | None = None
@@ -72,10 +63,6 @@ class ProviderError(RuntimeError):
         self.attempts = attempts
         detail = ", ".join(f"{m} ({why})" for m, why in attempts) or "no candidates"
         super().__init__(f"No model produced a result. Tried: {detail}")
-
-
-class EmbeddingDimensionMismatch(RuntimeError):
-    """Raised instead of writing vectors that would corrupt an existing store."""
 
 
 class Endpoint(NamedTuple):
@@ -153,17 +140,6 @@ def default_chat_model() -> str:
     return os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 
 
-def default_embedding_model() -> str:
-    """`auto` is not verified for embeddings, so always an explicit model."""
-    chosen = get_embedding_model()
-    gateway = resolve_endpoint().gateway
-    if chosen:
-        return _normalize(chosen, gateway)
-    if gateway == "omniroute":
-        return "openai/text-embedding-3-small"  # 1536 dims, matches existing stores
-    return "text-embedding-3-small"
-
-
 # --------------------------------------------------------------------------
 # transport
 # --------------------------------------------------------------------------
@@ -226,7 +202,6 @@ def _static(ids: list[str], owner: str = "openai") -> list[dict]:
             {
                 "id": i,
                 "owned_by": provider if name else ("omniroute" if i.startswith("auto") else owner),
-                "dimensions": KNOWN_DIMENSIONS.get(name or i),
             }
         )
     return out
@@ -253,42 +228,6 @@ def list_chat_models(refresh: bool = False) -> tuple[list[dict], str | None]:
     models = autos + rest
     return (models, None) if models else (_static(STATIC_OPENAI_CHAT), "Catalog returned no models; showing a static list.")
 
-
-def list_embedding_models(refresh: bool = False) -> tuple[list[dict], str | None]:
-    """Embedding models from OmniRoute's ``GET /v1/embeddings`` catalog."""
-    gateway = resolve_endpoint().gateway
-    entries, warning = _fetch_catalog("/embeddings", refresh)
-    # An empty catalog is as unusable as an unreachable one: OmniRoute answers 200 with
-    # data:[] when it holds no embedding-provider credentials, and returning ([], None)
-    # left the Settings dropdown empty with nothing explaining why.
-    if not entries:
-        ids = (
-            ["openai/text-embedding-3-small", "openai/text-embedding-3-large", "openai/text-embedding-ada-002"]
-            if gateway == "omniroute"
-            else list(KNOWN_DIMENSIONS)
-        )
-        note = (
-            f"Embedding catalog unreachable ({warning}); showing a static list."
-            if entries is None
-            else "This gateway reports no embedding models -- it likely holds no embedding "
-                 "provider credentials. The list below is static and these models may be "
-                 "rejected; RAG stays off until one works."
-        )
-        return _static(ids), (note if gateway == "omniroute" else None)
-    for e in entries:
-        e.setdefault("dimensions", KNOWN_DIMENSIONS.get(str(e["id"]).rpartition("/")[2]))
-    return sorted(entries, key=lambda e: (str(e.get("owned_by") or ""), str(e["id"]))), None
-
-
-def model_dimensions(model: str) -> int | None:
-    """Vector width for an embedding model, if the catalog or the static map knows."""
-    entries, _ = list_embedding_models()
-    for e in entries:
-        if str(e["id"]) == model:
-            dims = e.get("dimensions")
-            if isinstance(dims, int):
-                return dims
-    return KNOWN_DIMENSIONS.get(model.rpartition("/")[2])
 
 
 # --------------------------------------------------------------------------
@@ -494,102 +433,3 @@ def test_connection(model: str | None = None) -> tuple[bool, Attribution | None,
         return True, attribution, None
     except Exception as exc:
         return False, None, str(exc)
-
-
-# --------------------------------------------------------------------------
-# embeddings
-# --------------------------------------------------------------------------
-
-STORE_META = "embedding_meta.json"
-
-
-def read_store_meta(store_path: str | Path) -> dict | None:
-    """The model + dimensions an existing FAISS store was built with."""
-    meta = Path(store_path) / STORE_META
-    try:
-        return json.loads(meta.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def write_store_meta(store_path: str | Path, attribution: Attribution, dimensions: int | None) -> None:
-    path = Path(store_path)
-    path.mkdir(parents=True, exist_ok=True)
-    (path / STORE_META).write_text(
-        json.dumps(
-            {"provider": attribution.provider, "model": attribution.model or attribution.requested_model,
-             "requested_model": attribution.requested_model, "dimensions": dimensions,
-             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-class OmniRouteEmbeddings(Embeddings):
-    """LangChain adapter so ``FAISS.from_documents`` keeps working unchanged.
-
-    Records ``.last_attribution`` after each batch. The fallback chain here is
-    dimension-constrained: a candidate whose vector width differs from the active
-    store's is not a candidate, because mixing widths corrupts the store.
-    """
-
-    def __init__(self, model: str | None = None, expected_dimensions: int | None = None):
-        self.model = model or default_embedding_model()
-        self.expected_dimensions = expected_dimensions
-        self.last_attribution: Attribution | None = None
-        self.dimensions: int | None = None
-
-    def _candidates(self) -> list[str]:
-        ep = resolve_endpoint()
-        requested = _normalize(self.model, ep.gateway)
-        chain = _chain(requested, [default_embedding_model()])
-        if self.expected_dimensions is None:
-            return chain
-        kept = [m for m in chain if model_dimensions(m) in (None, self.expected_dimensions)]
-        if not kept:
-            raise EmbeddingDimensionMismatch(
-                f"No embedding model matches the existing store's {self.expected_dimensions} "
-                f"dimensions (tried {', '.join(chain)}). Refusing to write mixed vectors -- "
-                "clear src/data/vector_store/ or pick a matching model."
-            )
-        return kept
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        ep = resolve_endpoint()
-        attempts: list[tuple[str, str]] = []
-        for candidate in self._candidates():
-            started = time.monotonic()
-            try:
-                raw = _client().embeddings.with_raw_response.create(model=candidate, input=texts)
-            except Exception as exc:
-                retryable, reason = _classify(exc)
-                attempts.append((candidate, reason))
-                logger.warning("embeddings: %s failed (%s)", candidate, reason)
-                if not retryable:
-                    break
-                continue
-
-            body = raw.parse()
-            vectors = [item.embedding for item in sorted(body.data, key=lambda d: d.index)]
-            width = len(vectors[0]) if vectors else None
-            if self.expected_dimensions and width and width != self.expected_dimensions:
-                raise EmbeddingDimensionMismatch(
-                    f"{candidate} returned {width}-dim vectors but the existing store is "
-                    f"{self.expected_dimensions}-dim. Refusing to write mixed vectors."
-                )
-
-            self.dimensions = width
-            note = "fallback; " + "; then ".join(f"requested {m} {why}" for m, why in attempts) if attempts else None
-            self.last_attribution = _read_attribution(
-                requested=candidate, headers=raw.headers,
-                body_model=getattr(body, "model", None), gateway=ep.gateway,
-                measured_ms=int((time.monotonic() - started) * 1000),
-                fallback=bool(attempts), note=note,
-            )
-            return vectors
-
-        raise ProviderError(attempts)
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]

@@ -5,14 +5,16 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 from pathlib import Path
+from src.agents import data_ingestion
 from src.agents.data_ingestion import DataIngestionAgent
 from src.agents.test_generator import TestGeneratorAgent
 from src.utils.config import (
     load_environment, get_openai_api_key, set_openai_api_key,
     get_gateway_base_url, set_gateway_base_url,
     get_gateway_api_key, set_gateway_api_key,
-    set_llm_model, set_embedding_model,
+    set_llm_model,
 )
+from src.utils import embeddings as embeddings_mod
 from src.utils import provider
 import traceback
 from src.dashboard.components.sidebar import render_sidebar
@@ -101,7 +103,7 @@ def initialize_session_state():
         st.session_state.llm_model = provider.default_chat_model()
 
     if 'embedding_model' not in st.session_state:
-        st.session_state.embedding_model = provider.default_embedding_model()
+        st.session_state.embedding_model = embeddings_mod.default_model()
     
     if 'default_browser' not in st.session_state:
         st.session_state.default_browser = "Chromium"
@@ -512,14 +514,53 @@ def render_test_generation_page():
             st.success("✅ Session data cleared!")
             st.rerun()
 
+# Transcript methods that produce a fixed placeholder instead of the video's words.
+SYNTHETIC_TRANSCRIPT_METHODS = ("basic_fallback", "basic_fallback_file")
+
+
+def warn_if_synthetic_transcript(video_content):
+    """Say so when the transcript is a placeholder, not the video.
+
+    A silent video (no audio stream), a failed download, or a missing ffmpeg all end
+    at `_create_basic_transcript*`, which returns fixed boilerplate that knows only
+    the filename. Every later stage succeeds on it: it chunks, it embeds, it
+    retrieves, and the model writes confident test cases about a video it was never
+    shown. Nothing else catches this -- `wire_retriever` stays quiet because a store
+    *was* built, just from placeholder text.
+    """
+    if video_content.get('transcript_method') not in SYNTHETIC_TRANSCRIPT_METHODS:
+        return
+
+    reason = video_content.get('transcript_reason')
+    # Switch on the code, not on the reason text: the reason is trimmed for display
+    # and the decisive line is exactly what gets trimmed out.
+    hint = {
+        data_ingestion.NO_AUDIO:
+            "\n\nThis video has **no audio track**, so there is nothing to transcribe. "
+            "The pipeline reads speech only — it never looks at the picture — so a silent "
+            "screen recording cannot produce real test cases.",
+        data_ingestion.FFMPEG_MISSING:
+            "\n\n`ffmpeg` is missing; Whisper needs it to read the audio. "
+            "Install it (`brew install ffmpeg`) and re-run.",
+    }.get(video_content.get('transcript_cause'), "")
+
+    st.warning(
+        "📝 **The transcript is a placeholder, not this video.** Transcription failed, so "
+        "generation ran on fixed boilerplate that knows only the file name. The test cases "
+        "below are therefore generic and not derived from your video."
+        + (f"\n\nReason: `{reason}`" if reason else "")
+        + hint
+    )
+
+
 def wire_retriever(test_agent, data_agent, video_content):
     """Hand this run's vector store to the generator, and say so when there isn't one.
 
     Both generation paths route through here because the failure is otherwise
     invisible: no store means no retriever, the generator silently falls back to
     `transcript[:2000]` for every category, and the run still reports success --
-    just with markedly weaker prompts. A gateway holding no embedding-provider
-    credentials (OmniRoute answers those 400) hits this on every run.
+    just with markedly weaker prompts. Embeddings are local now, so the usual cause
+    is a model that would not load or a width mismatch against the existing store.
     """
     retriever = data_agent.setup_retrieval_chain()
     test_agent.set_retriever(retriever)
@@ -532,8 +573,8 @@ def wire_retriever(test_agent, data_agent, video_content):
         "category was prompted with the first 2000 characters of the transcript "
         "instead of chunks retrieved for it."
         + (f"\n\nReason: `{reason}`" if reason else "")
-        + "\n\nCheck Settings → AI Provider: if the embedding model list shows a "
-        "warning, the gateway holds no embedding credentials and RAG cannot run."
+        + "\n\nEmbeddings run locally — check the app log for the model load, and "
+        "Settings → AI Provider for the active embedding model and device."
     )
 
 
@@ -604,6 +645,7 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         # prompted with chunks relevant to it. Warns when there is no store (the
         # mock path, or a gateway that cannot embed) rather than degrading quietly.
         wire_retriever(test_agent, data_agent, video_content)
+        warn_if_synthetic_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -857,6 +899,7 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         
         # See the URL path: retrieval-backed context, transcript head if unavailable.
         wire_retriever(test_agent, data_agent, video_content)
+        warn_if_synthetic_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -1526,27 +1569,20 @@ def render_ai_provider_settings():
             key="settings_llm_model",
         )
 
-        embedding_models, embedding_warning = provider.list_embedding_models()
-        embedding_options = [m["id"] for m in embedding_models]
-        if embedding_warning:
-            st.warning(f"⚠️ {embedding_warning}")
-
-        default_embedding = st.selectbox(
-            "Default embedding model:",
-            embedding_options,
-            index=provider.option_index(embedding_options, st.session_state.get('embedding_model')),
-            help="Changing this invalidates any existing vector store — see below.",
-            key="settings_embedding_model",
+        # Embeddings do not come from the gateway -- it serves chat only. They are
+        # produced in-process, so there is one model and it is set by $EMBEDDING_MODEL.
+        default_embedding = embeddings_mod.default_model()
+        selected_dims = embeddings_mod.model_dimensions(default_embedding)
+        st.caption(
+            f"🔡 Embeddings: `{default_embedding}` on **{embeddings_mod.resolve_device()}**"
+            + (f" — {selected_dims} dims" if selected_dims else "")
+            + " (local, in-process; set `EMBEDDING_MODEL` / `EMBEDDING_DEVICE` to change)"
         )
-        selected_dims = provider.model_dimensions(default_embedding)
-        if selected_dims:
-            st.caption(f"🔡 {provider.pretty(None, default_embedding)} — {selected_dims} dims")
 
         col_save, col_test = st.columns(2)
         with col_save:
             if st.button("💾 Save model defaults", use_container_width=True):
                 set_llm_model(default_llm)
-                set_embedding_model(default_embedding)
                 st.success("✅ Model defaults saved for this session.")
                 st.rerun()
         with col_test:
@@ -1561,8 +1597,9 @@ def render_ai_provider_settings():
         st.code(
             f"OMNIROUTE_BASE_URL={base_url.strip() or provider.DEFAULT_GATEWAY_URL}\n"
             f"OMNIROUTE_LLM_MODEL={default_llm}\n"
-            f"OMNIROUTE_EMBEDDING_MODEL={default_embedding}\n"
             f"OMNIROUTE_TIMEOUT={int(provider.timeout_seconds())}\n"
+            f"EMBEDDING_MODEL={default_embedding}\n"
+            f"EMBEDDING_DEVICE={embeddings_mod.resolve_device()}\n"
             "# OMNIROUTE_API_KEY=only-if-REQUIRE_API_KEY-is-true",
             language="bash",
         )
@@ -1571,7 +1608,7 @@ def render_ai_provider_settings():
 def render_vector_store_settings():
     """Vector width is a correctness constraint: mixing widths corrupts the store."""
     store_path = Path("src/data/vector_store")
-    stored = provider.read_store_meta(store_path)
+    stored = embeddings_mod.read_store_meta(store_path)
     if not stored:
         return
 
@@ -1580,9 +1617,7 @@ def render_vector_store_settings():
             f"Built with {provider.pretty(stored.get('provider'), stored.get('model'))}"
             f" — {stored.get('dimensions')} dims, {stored.get('written_at', 'unknown date')}"
         )
-        configured = provider.model_dimensions(
-            st.session_state.get('embedding_model') or provider.default_embedding_model()
-        )
+        configured = embeddings_mod.model_dimensions(embeddings_mod.default_model())
         if configured and stored.get('dimensions') and configured != stored['dimensions']:
             st.error(
                 f"⚠️ The selected embedding model produces {configured}-dim vectors but this "

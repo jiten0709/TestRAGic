@@ -1,5 +1,7 @@
-"""The outer fallback chain: order, bounds, what is retryable, and the
-dimension guard that keeps a FAISS store from being corrupted."""
+"""The outer chat fallback chain: order, bounds, and what is retryable.
+
+Embeddings have no chain -- they are produced locally by one model, and their
+width guard is covered in test_embeddings.py."""
 
 import pytest
 
@@ -132,97 +134,3 @@ def test_an_empty_response_is_flagged_but_not_a_provider_failure(gateway):
     assert text == ""
     assert attribution.fallback is False
     assert "empty response" in attribution.note
-
-
-# --------------------------------------------------------------------------
-# embeddings: the chain is dimension-constrained
-# --------------------------------------------------------------------------
-
-def test_embeddings_succeed_and_record_attribution(gateway):
-    embeddings = provider.OmniRouteEmbeddings(model="openai/text-embedding-3-small")
-    vectors = embeddings.embed_documents(["one", "two"])
-
-    assert len(vectors) == 2 and len(vectors[0]) == 1536
-    assert embeddings.dimensions == 1536
-    assert embeddings.last_attribution.provider == "openai"
-
-
-def test_embed_query_returns_a_single_vector(gateway):
-    embeddings = provider.OmniRouteEmbeddings(model="openai/text-embedding-3-small")
-    assert len(embeddings.embed_query("hello")) == 1536
-
-
-def test_a_width_mismatched_candidate_is_dropped_from_the_chain(gateway):
-    """3-large is 3072-dim; against a 1536-dim store it is not a candidate."""
-    embeddings = provider.OmniRouteEmbeddings(
-        model="openai/text-embedding-3-large", expected_dimensions=1536
-    )
-    embeddings.embed_documents(["one"])
-
-    assert gateway.embedding_models_called == ["openai/text-embedding-3-small"]
-    assert embeddings.dimensions == 1536
-
-
-def test_an_empty_dimension_chain_fails_loudly(gateway):
-    """Fail rather than write vectors that would corrupt the store."""
-    embeddings = provider.OmniRouteEmbeddings(
-        model="openai/text-embedding-3-large", expected_dimensions=768
-    )
-    with pytest.raises(provider.EmbeddingDimensionMismatch) as excinfo:
-        embeddings.embed_documents(["one"])
-
-    assert gateway.embedding_models_called == [], "nothing was sent, nothing was written"
-    assert "768" in str(excinfo.value)
-
-
-def test_an_unexpected_returned_width_is_refused(gateway):
-    """The catalog can be wrong; the vectors themselves are checked too."""
-    gateway.embeddings_by_model["mystery/model"] = gateway.embeddings_ok(
-        "mystery", "model", dimensions=768
-    )
-    embeddings = provider.OmniRouteEmbeddings(model="mystery/model", expected_dimensions=1536)
-
-    with pytest.raises(provider.EmbeddingDimensionMismatch) as excinfo:
-        embeddings.embed_documents(["one"])
-    assert "768" in str(excinfo.value) and "1536" in str(excinfo.value)
-
-
-def test_embedding_failures_fall_back_within_the_same_width(gateway):
-    gateway.embeddings_by_model["openai/text-embedding-ada-002"] = gateway.status(429)
-    embeddings = provider.OmniRouteEmbeddings(
-        model="openai/text-embedding-ada-002", expected_dimensions=1536
-    )
-    embeddings.embed_documents(["one"])
-
-    assert gateway.embedding_models_called == [
-        "openai/text-embedding-ada-002", "openai/text-embedding-3-small",
-    ]
-    assert embeddings.last_attribution.fallback is True
-
-
-def test_embeddings_have_no_auto_rung(gateway):
-    """`auto` is documented for chat only; it is never used for embeddings."""
-    gateway.default_embeddings = gateway.status(500)
-    with pytest.raises(provider.ProviderError):
-        provider.OmniRouteEmbeddings(model="openai/text-embedding-3-small").embed_documents(["x"])
-
-    assert "auto" not in gateway.embedding_models_called
-
-
-# --------------------------------------------------------------------------
-# what the store records about itself
-# --------------------------------------------------------------------------
-
-def test_store_meta_round_trips(gateway, tmp_path):
-    embeddings = provider.OmniRouteEmbeddings(model="openai/text-embedding-3-small")
-    embeddings.embed_documents(["one"])
-    provider.write_store_meta(tmp_path, embeddings.last_attribution, embeddings.dimensions)
-
-    meta = provider.read_store_meta(tmp_path)
-    assert meta["dimensions"] == 1536
-    assert meta["model"] == "text-embedding-3-small"
-
-
-def test_missing_store_meta_is_none(tmp_path):
-    assert provider.read_store_meta(tmp_path) is None
-    assert provider.read_store_meta(tmp_path / "nope") is None

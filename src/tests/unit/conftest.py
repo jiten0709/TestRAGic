@@ -51,34 +51,6 @@ def chat_ok(provider_name="openai", model="gpt-4o-mini", content="[]",
     return handler
 
 
-def embeddings_ok(provider_name="openai", model="text-embedding-3-small",
-                  dimensions=1536, headers=True):
-    def handler(request, body):
-        inputs = body.get("input") or [""]
-        if isinstance(inputs, str):
-            inputs = [inputs]
-        hdrs = {
-            "X-OmniRoute-Provider": provider_name,
-            "X-OmniRoute-Model": model,
-            "X-OmniRoute-Latency-Ms": "88",
-            "X-OmniRoute-Request-Id": "req-emb",
-        } if headers else {}
-        return httpx.Response(
-            200,
-            headers=hdrs,
-            json={
-                "object": "list",
-                "model": model,
-                "data": [
-                    {"object": "embedding", "index": i, "embedding": [0.01] * dimensions}
-                    for i in range(len(inputs))
-                ],
-                "usage": {"prompt_tokens": 1, "total_tokens": 1},
-            },
-        )
-    return handler
-
-
 def status(code, message="boom"):
     """A non-2xx response -- the SDK turns this into the matching exception type."""
     def handler(request, body):
@@ -107,30 +79,20 @@ class MockGateway:
 
     # response builders, reachable from any test via the `gateway` fixture
     chat_ok = staticmethod(chat_ok)
-    embeddings_ok = staticmethod(embeddings_ok)
     status = staticmethod(status)
     timeout = staticmethod(timeout)
     unreachable = staticmethod(unreachable)
 
     def __init__(self):
         self.chat_by_model = {}
-        self.embeddings_by_model = {}
         self.default_chat = chat_ok()
-        self.default_embeddings = embeddings_ok()
         self.model_catalog = [
             {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
             {"id": "gemini-2.5-pro", "object": "model", "owned_by": "google"},
             {"id": "text-embedding-3-small", "object": "model",
              "owned_by": "openai", "type": "embedding"},
         ]
-        self.embedding_catalog = [
-            {"id": "openai/text-embedding-3-small", "object": "model",
-             "owned_by": "openai", "type": "embedding", "dimensions": 1536},
-            {"id": "openai/text-embedding-3-large", "object": "model",
-             "owned_by": "openai", "type": "embedding", "dimensions": 3072},
-        ]
         self.model_catalog_status = 200
-        self.embedding_catalog_status = 200
         self.calls = []  # (method, path, model)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -146,16 +108,8 @@ class MockGateway:
                 return httpx.Response(self.model_catalog_status, json={"error": "nope"})
             return httpx.Response(200, json={"object": "list", "data": self.model_catalog})
 
-        if request.method == "GET" and path.endswith("/embeddings"):
-            if self.embedding_catalog_status != 200:
-                return httpx.Response(self.embedding_catalog_status, json={"error": "nope"})
-            return httpx.Response(200, json={"object": "list", "data": self.embedding_catalog})
-
         if path.endswith("/chat/completions"):
             return self.chat_by_model.get(model, self.default_chat)(request, body)
-
-        if path.endswith("/embeddings"):
-            return self.embeddings_by_model.get(model, self.default_embeddings)(request, body)
 
         return httpx.Response(404, json={"error": "unknown route"})
 
@@ -164,17 +118,13 @@ class MockGateway:
         return [m for method, p, m in self.calls
                 if method == "POST" and p.endswith("/chat/completions")]
 
-    @property
-    def embedding_models_called(self):
-        return [m for method, p, m in self.calls
-                if method == "POST" and p.endswith("/embeddings")]
 
 
 @pytest.fixture(autouse=True)
 def clean_provider(monkeypatch):
     """Every test starts with no provider env and no cached clients or catalogs."""
     for var in ("OMNIROUTE_BASE_URL", "OMNIROUTE_API_KEY", "OMNIROUTE_LLM_MODEL",
-                "OMNIROUTE_EMBEDDING_MODEL", "OMNIROUTE_TIMEOUT",
+                "EMBEDDING_MODEL", "EMBEDDING_DEVICE", "OMNIROUTE_TIMEOUT",
                 "TESTRAGIC_LLM_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL"):
         monkeypatch.delenv(var, raising=False)
     provider.reset_clients()
@@ -204,3 +154,44 @@ def openai_direct(monkeypatch):
     provider.reset_clients()
     yield gw
     provider.http_client.close()
+
+
+# --------------------------------------------------------------------------
+# the local encoder double
+# --------------------------------------------------------------------------
+
+class FakeEncoder:
+    """Stands in for a loaded SentenceTransformer. Records how it was called so the
+    query/document asymmetry and the batch size stay observable."""
+
+    def __init__(self, dimensions=1024):
+        self.dimensions = dimensions
+        self.calls = []  # (texts, kwargs)
+
+    def get_sentence_embedding_dimension(self):
+        return self.dimensions
+
+    def encode(self, texts, **kwargs):
+        import numpy as np
+        self.calls.append((list(texts), kwargs))
+        # distinct, unit-length rows: distinct so retrieval order is meaningful,
+        # unit-length because the real encoder is asked to normalize.
+        out = np.zeros((len(texts), self.dimensions), dtype="float32")
+        for row, text in enumerate(texts):
+            out[row][hash(text) % self.dimensions] = 1.0
+        return out
+
+    @property
+    def prompt_names(self):
+        return [kw.get("prompt_name") for _, kw in self.calls]
+
+
+@pytest.fixture
+def encoder(monkeypatch):
+    """Installs a FakeEncoder as the loaded model for the default model+device."""
+    from src.utils import embeddings as embeddings_mod
+
+    fake = FakeEncoder()
+    monkeypatch.setenv("EMBEDDING_DEVICE", "cpu")
+    monkeypatch.setattr(embeddings_mod, "_loaded", {(embeddings_mod.DEFAULT_MODEL, "cpu"): fake})
+    return fake

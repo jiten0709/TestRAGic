@@ -135,7 +135,7 @@
 - **RAG Pipeline**: Vector-based semantic search for context retrieval
 - **Vector Storage**: FAISS for efficient embeddings
 - **NLP Processing**: LangChain for text understanding
-- **Embeddings**: user-selectable embedding model, routed through the same gateway
+- **Embeddings**: `Qwen/Qwen3-Embedding-0.6B` run locally via sentence-transformers — **not** through the gateway
 
 ---
 
@@ -144,9 +144,12 @@
 ### Prerequisites
 
 - Python 3.13
-- An AI provider: either an OmniRoute gateway (Node >= 22, or Docker) **or** an OpenAI API key
+- An AI provider for **chat**: either an OmniRoute gateway (Node >= 22, or Docker) **or** an OpenAI API key
 - Node.js >= 22.22.2 — only if you run OmniRoute via npm
-- 4GB+ RAM recommended
+- `ffmpeg` on PATH (`brew install ffmpeg`) — Whisper needs it to transcribe uploaded video
+  files. Without it the upload path silently falls back to a synthetic transcript.
+- ~1.2GB disk and one-time download for the local embedding model (`Qwen/Qwen3-Embedding-0.6B`)
+- 4GB+ RAM recommended (the embedding model loads in float32, ~2.4GB)
 - macOS, Linux, or Windows
 
 ### 1. Installation & Setup
@@ -163,6 +166,9 @@ source venv/bin/activate  # On macOS/Linux
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Install ffmpeg (Whisper transcription of uploaded files)
+brew install ffmpeg           # macOS;  apt install ffmpeg  on Debian/Ubuntu
 
 # Install Playwright browsers
 playwright install
@@ -203,11 +209,15 @@ migration.
 | `OMNIROUTE_BASE_URL` | _(empty)_ | Gateway endpoint. **Setting this is what selects OmniRoute mode.** |
 | `OMNIROUTE_API_KEY` | _(empty)_ | Gateway key. Optional — a local instance runs with `REQUIRE_API_KEY=false`. |
 | `OMNIROUTE_LLM_MODEL` | `auto` | Persistent default chat model. `auto`, `auto/fast`, `provider/model`, … |
-| `OMNIROUTE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Persistent default embedding model (1536 dims). |
 | `OMNIROUTE_TIMEOUT` | `60` | Per-request timeout in seconds; bounds the fallback chain. |
 | `TESTRAGIC_LLM_PROVIDER` | _(unset)_ | Force `omniroute` or `openai`, overriding the rule above. |
 | `OPENAI_API_KEY` | _(empty)_ | Used when no gateway is configured. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Default model in OpenAI-direct mode. |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Local embedding model (1024 dims). Changing it invalidates the vector store. |
+| `EMBEDDING_DEVICE` | _(auto)_ | `cuda`, `mps` or `cpu`. Unset picks the best accelerator present. |
+| `EMBEDDING_BATCH_SIZE` | `16` | Texts per encode batch. |
+
+Embeddings are deliberately **not** `OMNIROUTE_*` variables: they never reach the gateway.
 
 `BASE_URL` is unrelated — it is the Playwright **test target** URL (`conftest.py`).
 
@@ -233,18 +243,20 @@ streamlit run run_app.py
 # endpoint OmniRoute exposes — it is not a second provider path.
 python -c "import streamlit, playwright, openai, langchain; print('✅ All dependencies installed!')"
 
-# Provider unit tests — pure Python, no network, no browser. ~8s.
-pytest src/tests/unit -o addopts="" -q          # expect: 96 passed, 1 skipped
+# Unit tests — pure Python, no network, no browser, no model download. ~5s.
+pytest src/tests/unit -o addopts="" -q          # expect: 98 passed
 
-# Live smoke test against a running OmniRoute gateway.
+# Live smoke test against a running OmniRoute gateway (chat only).
 # Skipped automatically when no gateway is reachable.
-#   5 passed            → chat AND embeddings both work
-#   4 passed, 1 skipped → chat works, gateway cannot embed (RAG will not run)
 OMNIROUTE_BASE_URL=http://localhost:20128/v1 \
   pytest src/tests/unit/test_live_omniroute.py -o addopts="" -q -s
 
 # One real query end to end, printing which provider actually answered.
 python src/tests/omniroute_test.py
+
+# Full RAG check: local Qwen3 vectors → FAISS retrieval → OmniRoute generation.
+# Downloads ~1.2GB of weights on first run. Exits non-zero on the first failure.
+python src/tests/rag_sanity.py
 
 # Playwright setup, one browser at a time.
 pytest -o addopts="" src/tests/generated/test_sample.py::test_basic_navigation --browser chromium -q
@@ -261,7 +273,7 @@ pytest -o addopts="" src/tests/generated/test_sample.py::test_basic_navigation -
 1. **Configure the AI provider**
    - Go to Settings → AI Provider in the sidebar
    - Set the OmniRoute base URL, or an OpenAI API key
-   - Pick the default LLM and embedding models
+   - Pick the default LLM model (the embedding model is local and shown read-only)
    - **Test connection** — it reports which provider actually answered
 
 2. **Try Mock Data** (recommended first)
@@ -319,18 +331,18 @@ pytest -o addopts="" src/tests/generated/test_sample.py::test_basic_navigation -
 - Bounded model fallback chain (requested → app default → `auto`)
 - Streamlit dashboard (single-page router in `src/dashboard/app.py`)
 - Vector storage (FAISS) with an enforced embedding-width guard
+- **RAG retrieval** — local `Qwen/Qwen3-Embedding-0.6B` vectors, per-category retrieval,
+  verified end to end on both generation paths
 - Mock data testing
 - Multi-format exports (JSON, Markdown)
 
 ### Conditional ⚠️
 
-- **RAG retrieval** — wired on both generation paths, but it needs a gateway that can
-  actually embed. OmniRoute only serves embeddings for providers it holds credentials
-  for; an instance wired to chat-only providers answers `GET /v1/embeddings` with
-  `data: []` and rejects embedding requests with `400`. When that happens the app falls
-  back to the first 2000 characters of the transcript for every category **and now says
-  so** in a warning on the generation page. Check Settings → AI Provider: a warning above
-  the embedding-model dropdown means RAG will not run.
+- **RAG retrieval degrades quietly if the embedding model cannot load.** The pipeline
+  falls back to the first 2000 characters of the transcript for every category **and says
+  so** in a warning on the generation page. Because embeddings are local, the usual causes
+  are a failed first-run download or a width mismatch against an existing store, not the
+  gateway.
 
 ### Simulated 🧪
 
@@ -400,33 +412,27 @@ curl -i http://localhost:20128/v1/models      # should return 200 + X-OmniRoute-
 
 ### ❌ "RAG is off for this run" / weak, repetitive test cases
 
-The most common cause is a gateway with **no embedding-provider credentials**. OmniRoute
-only serves embeddings for providers it holds keys for; a chat-only instance answers
-`GET /v1/embeddings` with `data: []` and rejects every embedding request with
-`400 "No credentials for embedding provider"`. No embeddings means no vector store, no
-retriever, and every test category prompted with the same opening 2000 characters of the
-transcript.
+Embeddings run locally, so the gateway is not the suspect. No vector store means no
+retriever, and every test category is prompted with the same opening 2000 characters of
+the transcript.
 
 ```bash
-# 1. Does the gateway list any embedding models?
-curl -s http://localhost:20128/v1/embeddings | python -m json.tool | head
-#    data: []  →  RAG cannot run.
-
-# 2. Will it actually embed?
-curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:20128/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"openai/text-embedding-3-small","input":"hello"}'
-#    200 = good.  400 = no credentials for that provider.
-
-# 3. Fix: open http://localhost:20128 and connect a provider that offers embeddings,
-#    then pick its model in Settings → AI Provider.
+# Run the three RAG stages and see which one fails.
+python src/tests/rag_sanity.py
 ```
 
-Signals in the UI: a warning above the embedding-model dropdown in Settings means the
-list is static, not live. A warning on the generation page means RAG was off for that
-specific run.
+Common causes:
 
-**Changing the embedding model changes the vector width**, and vectors of different
+- **First-run download failed.** The model is ~1.2GB from Hugging Face; re-run to resume.
+- **Width mismatch against an existing store.** Clear `src/data/vector_store/`
+  (Settings has a button) and re-ingest.
+- **`NonFiniteEmbedding` raised.** The accelerator returned NaN. Apple's MPS kernel does
+  this for padded batches on torch 2.7.1; the app detects it at load time and falls back
+  to CPU, logging a warning. Force it with `EMBEDDING_DEVICE=cpu`.
+
+A warning on the generation page means RAG was off for that specific run.
+
+**Changing `EMBEDDING_MODEL` changes the vector width**, and vectors of different
 widths are not comparable. The app refuses to mix them rather than silently corrupting
 the index — clear `src/data/vector_store/` (Settings has a button) and re-ingest.
 

@@ -8,6 +8,10 @@ unaffected. To run it, boot the gateway and point the suite at it:
 
 These are the phase-0 checks from the migration plan, as code: the whole
 attribution design rests on the X-OmniRoute-* headers actually arriving.
+
+Embeddings are absent here on purpose -- they no longer touch the gateway. The
+local encoder is covered by test_embeddings.py (mocked) and src/tests/rag_sanity.py
+(real weights, end to end).
 """
 
 import os
@@ -59,27 +63,6 @@ def test_the_model_catalog_is_reachable():
     assert any(m["id"].startswith("auto") for m in models)
 
 
-def _gateway_serves_embeddings():
-    """OmniRoute only serves embeddings for providers it holds credentials for; an
-    instance wired to chat-only providers answers every request with
-    400 "No credentials for embedding provider"."""
-    models, warning = provider.list_embedding_models(refresh=True)
-    # A warning means the list is the static fallback, not the gateway's own catalog.
-    return bool(models) and not warning
-
-
-def test_the_embedding_catalog_is_reachable():
-    """Reachable, not necessarily populated: an instance wired only to chat providers
-    answers 200 with data:[]. That is a real deployment, so it must not read as a
-    transport failure -- but it must surface a warning rather than an empty list."""
-    models, warning = provider.list_embedding_models(refresh=True)
-    assert models, "a static list must be offered even when the gateway reports none"
-    if warning:
-        print(f"\nembedding catalog empty/unavailable: {warning}")
-    else:
-        print(f"\nembedding models: {[m['id'] for m in models][:5]}")
-
-
 def test_auto_answers_and_the_attribution_headers_arrive():
     """The finding the whole attribution design rests on."""
     text, attribution = provider.chat("Reply with the single word: pong", model="auto")
@@ -93,23 +76,6 @@ def test_auto_answers_and_the_attribution_headers_arrive():
         "response body. Check for a reverse proxy stripping X-* headers."
     )
     assert attribution.provider and attribution.model
-
-
-@pytest.mark.skipif(
-    not _gateway_serves_embeddings(),
-    reason="gateway has no embedding provider credentials -- RAG cannot be exercised here",
-)
-def test_embeddings_answer_with_the_expected_width():
-    model = provider.default_embedding_model()
-    embeddings = provider.OmniRouteEmbeddings(model=model)
-    vectors = embeddings.embed_documents(["a short chunk", "another chunk"])
-
-    assert len(vectors) == 2
-    print(f"\nembedded by: {embeddings.last_attribution.display} "
-          f"({embeddings.dimensions} dims)")
-    expected = provider.model_dimensions(model)
-    if expected:
-        assert embeddings.dimensions == expected, "catalog width disagrees with reality"
 
 
 def test_an_invalid_model_falls_back_rather_than_crashing():
