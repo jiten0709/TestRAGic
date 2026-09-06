@@ -27,7 +27,10 @@ def browser_type_launch_args(browser_type_launch_args):
         ]
     }
 
-@pytest.fixture
+# Session-scoped to match the pytest-base-url fixture this overrides: the plugin's
+# autouse session-scoped _verify_url requests it, and a function-scoped override
+# raises ScopeMismatch during collection for every test in the repo.
+@pytest.fixture(scope="session")
 def base_url():
     """Base URL for the application under test"""
     return os.getenv("BASE_URL", "http://localhost:3000")

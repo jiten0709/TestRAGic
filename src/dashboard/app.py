@@ -5,9 +5,17 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 from pathlib import Path
+from src.agents import data_ingestion
 from src.agents.data_ingestion import DataIngestionAgent
 from src.agents.test_generator import TestGeneratorAgent
-from src.utils.config import load_environment, get_openai_api_key, set_openai_api_key
+from src.utils.config import (
+    load_environment, get_openai_api_key, set_openai_api_key,
+    get_gateway_base_url, set_gateway_base_url,
+    get_gateway_api_key, set_gateway_api_key,
+    set_llm_model,
+)
+from src.utils import embeddings as embeddings_mod
+from src.utils import provider
 import traceback
 from src.dashboard.components.sidebar import render_sidebar
 
@@ -25,8 +33,8 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Check if API key is configured
-    if not get_openai_api_key():
+    # Either an OmniRoute gateway or an OpenAI key is enough to run.
+    if not provider.is_configured():
         show_api_key_warning()
         return
     
@@ -92,7 +100,10 @@ def initialize_session_state():
         st.session_state.priority_levels = ["Critical", "High"]
     
     if 'llm_model' not in st.session_state:
-        st.session_state.llm_model = "gpt-4o"
+        st.session_state.llm_model = provider.default_chat_model()
+
+    if 'embedding_model' not in st.session_state:
+        st.session_state.embedding_model = embeddings_mod.default_model()
     
     if 'default_browser' not in st.session_state:
         st.session_state.default_browser = "Chromium"
@@ -108,33 +119,55 @@ def initialize_session_state():
         }
 
 def show_api_key_warning():
-    """Show API key configuration warning"""
-    st.error("🔑 OpenAI API Key Required")
+    """Explain both ways to configure a provider. Neither is set."""
+    st.error("🔌 No AI provider configured")
     st.markdown("""
-    Please configure your OpenAI API Key to use TestRAGic:
-    
-    1. Go to **⚙️ Settings** page
-    2. Enter your OpenAI API Key
-    3. Click **Save Settings**
-    
-    Or set the `OPENAI_API_KEY` environment variable in your `.env` file.
+    TestRAGic needs somewhere to send its requests. Pick either:
+
+    **A. OmniRoute gateway (recommended — 350+ providers, one endpoint)**
+
+    ```bash
+    npm i -g omniroute && omniroute      # boots on http://localhost:20128
+    ```
+    Then set `OMNIROUTE_BASE_URL=http://localhost:20128/v1` in your `.env`.
+    A local instance needs no API key.
+
+    **B. OpenAI directly** — set `OPENAI_API_KEY` in your `.env`, or enter it below.
     """)
-    
-    # Quick API key input
-    st.subheader("Quick Setup")
-    api_key_input = st.text_input(
-        "Enter OpenAI API Key:",
-        type="password",
-        placeholder="sk-proj-..."
-    )
-    
-    if st.button("💾 Save API Key", type="primary"):
-        if api_key_input:
-            set_openai_api_key(api_key_input)
-            st.success("✅ API Key saved! Please refresh the page.")
-            st.rerun()
-        else:
-            st.error("Please enter a valid API key")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("OmniRoute gateway")
+        base_url = st.text_input(
+            "Gateway base URL:",
+            value=get_gateway_base_url() or "",
+            placeholder=provider.DEFAULT_GATEWAY_URL,
+        )
+        if st.button("🔌 Use gateway", use_container_width=True):
+            if base_url:
+                set_gateway_base_url(base_url)
+                provider.reset_clients()
+                st.success("✅ Gateway configured! Reloading…")
+                st.rerun()
+            else:
+                st.error("Please enter a gateway URL")
+
+    with col2:
+        st.subheader("OpenAI direct")
+        api_key_input = st.text_input(
+            "OpenAI API Key:",
+            type="password",
+            placeholder="sk-proj-...",
+        )
+        if st.button("💾 Save API key", type="primary", use_container_width=True):
+            if api_key_input:
+                set_openai_api_key(api_key_input)
+                provider.reset_clients()
+                st.success("✅ API Key saved! Reloading…")
+                st.rerun()
+            else:
+                st.error("Please enter a valid API key")
 
 def test_with_mock_data():
     """Test test generation with mock video data"""
@@ -360,20 +393,34 @@ def render_test_generation_page():
             )
             st.session_state.priority_levels = priority_levels
             
-            llm_model = st.selectbox(
-                "LLM Model:",
-                ["gpt-4o-mini", "gpt-4o", "gpt-4.1"],
-                index=["gpt-4o-mini", "gpt-4o", "gpt-4.1"].index(st.session_state.llm_model),
-                key="llm_model_input"
-            )
+            chat_models, catalog_warning = provider.list_chat_models()
+            model_options = [m["id"] for m in chat_models]
+            if catalog_warning:
+                st.warning(f"⚠️ {catalog_warning}")
+
+            col_model, col_refresh = st.columns([6, 1])
+            with col_model:
+                llm_model = st.selectbox(
+                    "LLM Model:",
+                    model_options,
+                    # option_index, not .index(): a dynamic catalog makes the bare
+                    # call a guaranteed ValueError once the default drops out.
+                    index=provider.option_index(model_options, st.session_state.llm_model),
+                    key="llm_model_input",
+                    help="Served by the configured provider. 'auto' lets OmniRoute choose.",
+                )
+            with col_refresh:
+                st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+                if st.button("🔄", help="Refresh the model catalog"):
+                    provider.list_chat_models(refresh=True)
+                    st.rerun()
             st.session_state.llm_model = llm_model
         
         # Generation button
         if st.button("🚀 Generate Test Cases", type="primary", use_container_width=True):
-            # Validate API key
-            api_key = get_openai_api_key()
-            if not api_key:
-                st.error("❌ OpenAI API Key not configured. Please go to Settings to add your API key.")
+            # Validate provider configuration
+            if not provider.is_configured():
+                st.error("❌ No AI provider configured. Set a gateway URL or an API key in Settings.")
                 return
             
             # Validate inputs before processing
@@ -467,6 +514,70 @@ def render_test_generation_page():
             st.success("✅ Session data cleared!")
             st.rerun()
 
+# Transcript methods that produce a fixed placeholder instead of the video's words.
+SYNTHETIC_TRANSCRIPT_METHODS = ("basic_fallback", "basic_fallback_file")
+
+
+def warn_if_synthetic_transcript(video_content):
+    """Say so when the transcript is a placeholder, not the video.
+
+    A silent video (no audio stream), a failed download, or a missing ffmpeg all end
+    at `_create_basic_transcript*`, which returns fixed boilerplate that knows only
+    the filename. Every later stage succeeds on it: it chunks, it embeds, it
+    retrieves, and the model writes confident test cases about a video it was never
+    shown. Nothing else catches this -- `wire_retriever` stays quiet because a store
+    *was* built, just from placeholder text.
+    """
+    if video_content.get('transcript_method') not in SYNTHETIC_TRANSCRIPT_METHODS:
+        return
+
+    reason = video_content.get('transcript_reason')
+    # Switch on the code, not on the reason text: the reason is trimmed for display
+    # and the decisive line is exactly what gets trimmed out.
+    hint = {
+        data_ingestion.NO_AUDIO:
+            "\n\nThis video has **no audio track**, so there is nothing to transcribe. "
+            "The pipeline reads speech only — it never looks at the picture — so a silent "
+            "screen recording cannot produce real test cases.",
+        data_ingestion.FFMPEG_MISSING:
+            "\n\n`ffmpeg` is missing; Whisper needs it to read the audio. "
+            "Install it (`brew install ffmpeg`) and re-run.",
+    }.get(video_content.get('transcript_cause'), "")
+
+    st.warning(
+        "📝 **The transcript is a placeholder, not this video.** Transcription failed, so "
+        "generation ran on fixed boilerplate that knows only the file name. The test cases "
+        "below are therefore generic and not derived from your video."
+        + (f"\n\nReason: `{reason}`" if reason else "")
+        + hint
+    )
+
+
+def wire_retriever(test_agent, data_agent, video_content):
+    """Hand this run's vector store to the generator, and say so when there isn't one.
+
+    Both generation paths route through here because the failure is otherwise
+    invisible: no store means no retriever, the generator silently falls back to
+    `transcript[:2000]` for every category, and the run still reports success --
+    just with markedly weaker prompts. Embeddings are local now, so the usual cause
+    is a model that would not load or a width mismatch against the existing store.
+    """
+    retriever = data_agent.setup_retrieval_chain()
+    test_agent.set_retriever(retriever)
+    if retriever is not None:
+        return
+
+    reason = (video_content.get('vector_store_info') or {}).get('error')
+    st.warning(
+        "🔍 **RAG is off for this run.** No vector store was available, so every "
+        "category was prompted with the first 2000 characters of the transcript "
+        "instead of chunks retrieved for it."
+        + (f"\n\nReason: `{reason}`" if reason else "")
+        + "\n\nEmbeddings run locally — check the app log for the model load, and "
+        "Settings → AI Provider for the active embedding model and device."
+    )
+
+
 def generate_test_cases_from_url(url, categories, priorities, model):
     """Generate test cases from YouTube URL"""
     progress_bar = st.progress(0)
@@ -482,21 +593,17 @@ def generate_test_cases_from_url(url, categories, priorities, model):
             st.error("❌ Please select at least one test category")
             return
         
-        # Ensure API key is set and valid
-        api_key = get_openai_api_key()
-        if not api_key:
-            st.error("❌ OpenAI API Key not configured")
-            st.info("Please go to Settings to configure your API key")
+        # Either a gateway URL or an API key will do. There is no key format to
+        # police: a local OmniRoute instance is keyless by default, and a gateway
+        # key is whatever its operator chose.
+        if not provider.is_configured():
+            st.error("❌ No AI provider configured")
+            st.info("Set an OmniRoute gateway URL or an OpenAI API key in Settings")
             return
-        
-        # Validate API key format
-        if not api_key.startswith('sk-'):
-            st.error("❌ Invalid OpenAI API Key format")
-            st.info("API key should start with 'sk-'")
-            return
-        
-        # Set API key in environment for agents
-        os.environ["OPENAI_API_KEY"] = api_key
+
+        endpoint = provider.resolve_endpoint()
+        if endpoint.gateway == "openai" and endpoint.api_key:
+            os.environ["OPENAI_API_KEY"] = endpoint.api_key
         
         # Initialize agents
         status_text.text("🔧 Initializing AI agents...")
@@ -517,15 +624,28 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         progress_bar.progress(25)
         
         # Add mock data option for testing
-        if url == "test" or "test" in url.lower():
+        # NOTE: this substring match means any real URL containing "test" is
+        # silently swapped for canned input. Pre-existing bug, tracked separately;
+        # labelled here so a mock run is never mistaken for a real one.
+        used_mock_input = url == "test" or "test" in url.lower()
+        if used_mock_input:
             video_content = test_with_mock_data()
-            st.info("🧪 Using mock data for testing")
+            st.warning(
+                "🧪 Mock input — the transcript below is canned, not from this URL. "
+                "Test cases are still model-generated, but from fake source material."
+            )
         else:
             video_content = data_agent.process_video_content(url)
         
         if not video_content.get("success"):
             st.error(f"❌ Video processing failed: {video_content.get('error')}")
             return
+        
+        # Feed the freshly-built vector store to the generator so each category is
+        # prompted with chunks relevant to it. Warns when there is no store (the
+        # mock path, or a gateway that cannot embed) rather than degrading quietly.
+        wire_retriever(test_agent, data_agent, video_content)
+        warn_if_synthetic_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -571,16 +691,27 @@ def generate_test_cases_from_url(url, categories, priorities, model):
                 formatted_cases = test_agent.format_test_cases(test_cases)
             except Exception as e:
                 st.warning(f"format_test_cases failed: {e}")
-                formatted_cases = format_test_cases_fallback(test_cases)
+                formatted_cases = format_test_cases_fallback(test_cases, test_agent)
         else:
-            formatted_cases = format_test_cases_fallback(test_cases)
+            formatted_cases = format_test_cases_fallback(test_cases, test_agent)
         
         # Step 4: Display results
         status_text.text("✅ Complete!")
         progress_bar.progress(100)
         
+        # Fold in which model embedded the transcript (from the ingestion step).
+        store_info = video_content.get('vector_store_info') or {}
+        embedding_attribution = store_info.get('embedding_attribution')
+        if embedding_attribution and isinstance(formatted_cases, dict):
+            attribution = formatted_cases.setdefault('metadata', {}).setdefault('attribution', {})
+            attribution['embedding'] = {
+                'provider': embedding_attribution.get('provider'),
+                'model': embedding_attribution.get('model'),
+                'dimensions': store_info.get('embedding_dimensions'),
+            }
+
         # Show results
-        display_generated_test_cases(formatted_cases)
+        display_generated_test_cases(formatted_cases, used_mock_input=used_mock_input)
         
         # Update session state
         total_cases = len(formatted_cases.get('test_cases', [])) if isinstance(formatted_cases, dict) else len(formatted_cases) if isinstance(formatted_cases, list) else 0
@@ -689,29 +820,57 @@ def create_fallback_test_cases(video_content, categories, priorities):
     
     return test_cases
 
-def format_test_cases_fallback(test_cases):
-    """Format test cases when the agent's format method is not available"""
-    
+def render_attribution(metadata, prefix="🤖 Generated by"):
+    """Render who actually answered.
+
+    One rendering rule for every surface: the model that *served* the request is
+    the headline; a requested-but-unavailable model appears only in the note. A
+    requested model is never presented as if it were confirmed.
+    """
+    attribution = (metadata or {}).get('attribution')
+
+    if not attribution:
+        st.caption("🤖 Generated by: Unknown (saved before attribution tracking)")
+        return
+
+    note = attribution.get('note')
+
+    # No model produced this (mock data, or an exhausted fallback chain).
+    if not attribution.get('requested_model'):
+        st.caption(f"⚠️ {attribution.get('display') or 'no model was called'}"
+                   + (f" — {note}" if note else ""))
+        return
+
+    icon = "⚠️" if attribution.get('fallback') else "🤖"
+    st.caption(f"{icon} {prefix}: {attribution.get('display') or 'unknown'}")
+    if note:
+        st.caption(f"↳ {note}")
+
+    per_category = attribution.get('per_category') or []
+    if len(per_category) > 1:
+        with st.expander("Model details"):
+            st.dataframe(pd.DataFrame(per_category), use_container_width=True)
+
+
+def format_test_cases_fallback(test_cases, agent=None):
+    """Format test cases when the agent's format method is not available.
+
+    Carries attribution too, so the fallback path is not an attribution hole.
+    """
+    attribution = provider.summarize(getattr(agent, '_attributions', None) or [])
+
     if isinstance(test_cases, dict) and 'test_cases' in test_cases:
+        test_cases.setdefault('metadata', {}).setdefault('attribution', attribution)
         return test_cases
-    
-    if isinstance(test_cases, list):
-        return {
-            'test_cases': test_cases,
-            'metadata': {
-                'generated_at': datetime.datetime.now().isoformat(),
-                'total_cases': len(test_cases),
-                'generator': 'fallback'
-            }
-        }
-    
-    # If it's neither dict nor list, wrap it
+
+    cases = test_cases if isinstance(test_cases, list) else ([test_cases] if test_cases else [])
     return {
-        'test_cases': [test_cases] if test_cases else [],
+        'test_cases': cases,
         'metadata': {
             'generated_at': datetime.datetime.now().isoformat(),
-            'total_cases': 1 if test_cases else 0,
-            'generator': 'fallback'
+            'total_cases': len(cases),
+            'generator': 'fallback',
+            'attribution': attribution,
         }
     }
 
@@ -737,6 +896,10 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         status_text.text("🎬 Processing video file...")
         progress_bar.progress(25)
         video_content = data_agent.process_video_file(str(temp_file_path))
+        
+        # See the URL path: retrieval-backed context, transcript head if unavailable.
+        wire_retriever(test_agent, data_agent, video_content)
+        warn_if_synthetic_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -765,12 +928,23 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         progress_bar.empty()
         status_text.empty()
 
-def display_generated_test_cases(test_cases):
+def display_generated_test_cases(test_cases, used_mock_input=False):
     """Display generated test cases in a user-friendly format"""
     st.success("✅ Test cases generated successfully!")
-    
+
+    metadata = test_cases.get('metadata', {})
+    render_attribution(metadata)
+    if used_mock_input:
+        st.caption("🧪 Source material was mock data, not the supplied URL")
+
+    embedding = (metadata.get('attribution') or {}).get('embedding')
+    if embedding and embedding.get('model'):
+        dims = embedding.get('dimensions')
+        st.caption(f"🔡 Embedded by: {provider.pretty(embedding.get('provider'), embedding.get('model'))}"
+                   + (f" ({dims} dims)" if dims else ""))
+
     # Auto-save to file
-    video_info = test_cases.get('metadata', {})
+    video_info = metadata
     saved_file = save_generated_tests_to_file(test_cases, video_info)
     
     # Summary metrics
@@ -1167,9 +1341,32 @@ def load_test_cases_from_file(file_name):
         st.error(f"Error loading test cases from {file_name}: {e}")
         return []
 
+def latest_test_case_metadata():
+    """Metadata for the suite most recently generated, session first then disk."""
+    session = getattr(st.session_state, 'generated_tests', None)
+    if isinstance(session, dict) and session.get('metadata'):
+        return session['metadata']
+
+    test_cases_dir = Path("src/data/test_cases")
+    files = sorted(test_cases_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for file_path in files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f).get('metadata', {})
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def render_results_page():
     st.header("📊 Test Results & Reports")
-    
+
+    # Attribution for the generated suite. Files written before this change have no
+    # attribution key and render as Unknown rather than silently blank.
+    metadata = latest_test_case_metadata()
+    if metadata is not None:
+        render_attribution(metadata, prefix="🤖 Test cases generated by")
+
     # Load test results
     results = load_test_results()
     
@@ -1318,39 +1515,126 @@ def fix_duplicate_test_ids():
         st.success(f"✅ Fixed {fixed_count} test files!")
         st.rerun()
 
+def render_ai_provider_settings():
+    """The single place the provider, the models and the credentials are chosen."""
+    st.subheader("🔌 AI Provider")
+
+    endpoint = provider.resolve_endpoint()
+    if endpoint.gateway == "omniroute":
+        st.success(f"Mode: **OmniRoute gateway** — `{endpoint.base_url}`")
+    else:
+        st.info("Mode: **OpenAI direct** — set a gateway URL below to route through OmniRoute.")
+
+    with st.expander("Gateway & credentials", expanded=True):
+        base_url = st.text_input(
+            "OmniRoute base URL:",
+            value=get_gateway_base_url() or "",
+            placeholder=provider.DEFAULT_GATEWAY_URL,
+            help="Leave empty to talk to OpenAI directly. A local instance is keyless by default.",
+            key="omniroute_base_url_setting",
+        )
+        gateway_key = st.text_input(
+            "OmniRoute API key (optional):",
+            value=get_gateway_api_key() or "",
+            type="password",
+            help="Only needed when the gateway runs with REQUIRE_API_KEY=true.",
+            key="omniroute_key_setting",
+        )
+        openai_key = st.text_input(
+            "OpenAI API Key (direct mode / fallback):",
+            value=st.session_state.get('openai_api_key', ''),
+            type="password",
+            key="openai_key_setting",
+        )
+
+        if st.button("💾 Save provider settings", type="primary"):
+            set_gateway_base_url(base_url.strip())
+            set_gateway_api_key(gateway_key.strip())
+            if openai_key:
+                set_openai_api_key(openai_key)
+            provider.reset_clients()
+            st.success("✅ Provider settings saved for this session.")
+            st.rerun()
+
+    with st.expander("Models", expanded=True):
+        chat_models, chat_warning = provider.list_chat_models()
+        chat_options = [m["id"] for m in chat_models]
+        if chat_warning:
+            st.warning(f"⚠️ {chat_warning}")
+
+        default_llm = st.selectbox(
+            "Default LLM model:",
+            chat_options,
+            index=provider.option_index(chat_options, st.session_state.get('llm_model')),
+            key="settings_llm_model",
+        )
+
+        # Embeddings do not come from the gateway -- it serves chat only. They are
+        # produced in-process, so there is one model and it is set by $EMBEDDING_MODEL.
+        default_embedding = embeddings_mod.default_model()
+        selected_dims = embeddings_mod.model_dimensions(default_embedding)
+        st.caption(
+            f"🔡 Embeddings: `{default_embedding}` on **{embeddings_mod.resolve_device()}**"
+            + (f" — {selected_dims} dims" if selected_dims else "")
+            + " (local, in-process; set `EMBEDDING_MODEL` / `EMBEDDING_DEVICE` to change)"
+        )
+
+        col_save, col_test = st.columns(2)
+        with col_save:
+            if st.button("💾 Save model defaults", use_container_width=True):
+                set_llm_model(default_llm)
+                st.success("✅ Model defaults saved for this session.")
+                st.rerun()
+        with col_test:
+            if st.button("🔍 Test connection", use_container_width=True):
+                test_llm_connection(default_llm)
+
+    render_vector_store_settings()
+
+    with st.expander("Make it permanent (.env)"):
+        st.caption("The UI keeps choices for this session only, exactly like the API key. "
+                   "Paste this into `src/.env` for a persistent default:")
+        st.code(
+            f"OMNIROUTE_BASE_URL={base_url.strip() or provider.DEFAULT_GATEWAY_URL}\n"
+            f"OMNIROUTE_LLM_MODEL={default_llm}\n"
+            f"OMNIROUTE_TIMEOUT={int(provider.timeout_seconds())}\n"
+            f"EMBEDDING_MODEL={default_embedding}\n"
+            f"EMBEDDING_DEVICE={embeddings_mod.resolve_device()}\n"
+            "# OMNIROUTE_API_KEY=only-if-REQUIRE_API_KEY-is-true",
+            language="bash",
+        )
+
+
+def render_vector_store_settings():
+    """Vector width is a correctness constraint: mixing widths corrupts the store."""
+    store_path = Path("src/data/vector_store")
+    stored = embeddings_mod.read_store_meta(store_path)
+    if not stored:
+        return
+
+    with st.expander("🗂️ Vector store", expanded=False):
+        st.caption(
+            f"Built with {provider.pretty(stored.get('provider'), stored.get('model'))}"
+            f" — {stored.get('dimensions')} dims, {stored.get('written_at', 'unknown date')}"
+        )
+        configured = embeddings_mod.model_dimensions(embeddings_mod.default_model())
+        if configured and stored.get('dimensions') and configured != stored['dimensions']:
+            st.error(
+                f"⚠️ The selected embedding model produces {configured}-dim vectors but this "
+                f"store is {stored['dimensions']}-dim. Vectors of different widths are not "
+                "comparable — the store must be cleared before re-ingesting."
+            )
+            if st.button("🗑️ Clear vector store"):
+                for item in store_path.glob("*"):
+                    item.unlink()
+                st.success("✅ Vector store cleared. Re-ingest to rebuild it.")
+                st.rerun()
+
+
 def render_settings_page():
     st.header("⚙️ Settings")
     
-    # API Configuration
-    st.subheader("🔑 API Configuration")
-    
-    with st.expander("OpenAI Settings", expanded=True):
-        current_key = st.session_state.get('openai_api_key', '')
-        openai_key = st.text_input(
-            "OpenAI API Key:", 
-            value=current_key,
-            type="password",
-            help="Enter your OpenAI API key for LLM functionality",
-            key="openai_key_setting"
-        )
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("🔍 Test API Key"):
-                if openai_key:
-                    test_openai_connection(openai_key)
-                else:
-                    st.error("Please enter an API key")
-        
-        with col2:
-            if st.button("💾 Save API Key", type="primary"):
-                if openai_key:
-                    set_openai_api_key(openai_key)
-                    st.success("✅ API Key saved successfully!")
-                    st.rerun()
-                else:
-                    st.error("Please enter an API key")
+    render_ai_provider_settings()
     
     # Playwright Configuration
     st.subheader("🎭 Playwright Configuration")
@@ -1531,22 +1815,25 @@ def apply_filters(results, status_filter, browser_filter, priority_filter):
     
     return filtered
 
-def test_openai_connection(api_key):
-    """Test OpenAI API connection"""
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        
-        # Test with a simple completion
-        response = client.chat.completions.create(
-            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
-            messages=[{"role": "user", "content": "Test connection"}],
-            max_tokens=5
-        )
-        
-        st.success("✅ OpenAI API key is valid!")
-    except Exception as e:
-        st.error(f"❌ OpenAI API key test failed: {str(e)}")
+def test_llm_connection(model=None):
+    """Ping the configured provider and report which model actually answered."""
+    endpoint = provider.resolve_endpoint()
+    ok, attribution, error = provider.test_connection(model)
+
+    if not ok:
+        st.error(f"❌ Connection failed via {endpoint.gateway} at {endpoint.base_url}")
+        st.caption(error or "no detail reported")
+        if endpoint.gateway == "omniroute":
+            st.info("Is the gateway running? `npm i -g omniroute && omniroute`")
+        return False
+
+    latency = f" ({attribution.latency_ms}ms)" if attribution.latency_ms else ""
+    st.success(f"✅ Connected — answered by {attribution.display}{latency}")
+    if attribution.note:
+        st.caption(f"↳ {attribution.note}")
+    if attribution.source == "unknown":
+        st.caption("↳ the gateway did not report which model served this")
+    return True
 
 if __name__ == "__main__":
     main()

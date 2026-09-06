@@ -14,7 +14,7 @@ Responsive Design - Works well on different screen sizes
 import streamlit as st
 from streamlit_option_menu import option_menu
 from pathlib import Path
-from src.utils.config import get_openai_api_key
+from src.utils import provider
 from typing import Dict
 
 # Global constants
@@ -216,22 +216,22 @@ def render_enhanced_logo():
         """, unsafe_allow_html=True)
 
 def render_enhanced_api_status():
-    """Render enhanced API key status with beautiful cards"""
-    api_key = get_openai_api_key()
-    
-    if api_key:
-        st.markdown("""
+    """Render which AI provider is configured, and the model it will use"""
+    if provider.is_configured():
+        endpoint = provider.resolve_endpoint()
+        label = "OmniRoute" if endpoint.gateway == "omniroute" else "OpenAI"
+        st.markdown(f"""
         <div class="status-card status-success">
             <div style="font-size: 1.2rem;">✅</div>
-            <div style="font-weight: 600; margin-top: 0.3rem;">API Key Configured</div>
-            <div style="font-size: 0.8rem; opacity: 0.9;">OpenAI connection ready</div>
+            <div style="font-weight: 600; margin-top: 0.3rem;">AI Provider Ready</div>
+            <div style="font-size: 0.8rem; opacity: 0.9;">{label} · {provider.default_chat_model()}</div>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="status-card status-error">
             <div style="font-size: 1.2rem;">❌</div>
-            <div style="font-weight: 600; margin-top: 0.3rem;">API Key Missing</div>
+            <div style="font-weight: 600; margin-top: 0.3rem;">No AI Provider</div>
             <div style="font-size: 0.8rem; opacity: 0.9;">Configure in Settings</div>
         </div>
         """, unsafe_allow_html=True)
@@ -416,12 +416,13 @@ def _get_system_status() -> Dict:
     """Get system status for display"""
     status_items = {}
     
-    # Check API Key
-    api_key = get_openai_api_key()
-    if api_key:
-        status_items["OpenAI API"] = {"level": "success", "message": "Connected"}
+    # Check AI provider
+    if provider.is_configured():
+        endpoint = provider.resolve_endpoint()
+        label = "OmniRoute" if endpoint.gateway == "omniroute" else "OpenAI"
+        status_items["AI Provider"] = {"level": "success", "message": label}
     else:
-        status_items["OpenAI API"] = {"level": "error", "message": "Not configured"}
+        status_items["AI Provider"] = {"level": "error", "message": "Not configured"}
     
     # Check data directories
     try:
@@ -484,11 +485,11 @@ def _get_notifications() -> list:
             }
         ]
         
-        # Add API key notification if missing
-        if not get_openai_api_key():
+        # Add provider notification if missing
+        if not provider.is_configured():
             sample_notifications.append({
                 "level": "warning",
-                "message": "Please configure your OpenAI API key",
+                "message": "Configure an AI provider (OmniRoute gateway or OpenAI key)",
                 "timestamp": current_time
             })
         
@@ -551,13 +552,11 @@ def render_settings_section():
     """Render settings section"""
     st.markdown('<div class="section-header">⚙️ Settings</div>', unsafe_allow_html=True)
     
-    # API Key status
-    api_key = get_openai_api_key()
-    
-    if api_key:
+    # AI provider status
+    if provider.is_configured():
         st.markdown("""
         <div class="status-card status-success">
-            <div>✅ API Key Configured</div>
+            <div>✅ AI Provider Configured</div>
         </div>
         """, unsafe_allow_html=True)
     else:

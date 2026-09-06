@@ -1,0 +1,7 @@
+# Youtube demo video links
+1. https://www.youtube.com/watch?v=iBTWBhODSU0
+2. https://www.youtube.com/watch?v=KSzmCo9xxVs
+3. https://www.youtube.com/watch?v=RPOcUV39JdQ
+
+# Record demo video links
+1. https://admin-demo.nopcommerce.com/login
