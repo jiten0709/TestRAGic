@@ -207,7 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 # other files
-NOTES.md
 .venv
 src/agents/__pycache__
 github_openai.example.py
@@ -220,3 +219,10 @@ src/data/vector_store/*
 src/data/videos/*
 
 temp/*
+docs
+.claude
+.claude-flow 
+.swarm
+agentdb.*
+CLAUDE.MD 
+ruvector.db 
