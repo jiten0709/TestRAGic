@@ -22,8 +22,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # ── Configuration ────────────────────────────────────────────────────────────
-FILE_MODE = "a"                 # "a" keeps history across runs, "w" starts each run fresh
-CONSOLE_LEVEL = logging.INFO    # what you see in the terminal
+FILE_MODE = "w"                 # "a" keeps history across runs, "w" starts each run fresh
+CONSOLE_LEVEL = logging.ERROR    # what you see in the terminal
 FILE_LEVEL = logging.DEBUG      # what lands in logs/*.log
 MAX_BYTES = 5_000_000           # per file, before it rolls
 BACKUP_COUNT = 3                # so a long-lived server keeps ~20MB per subsystem

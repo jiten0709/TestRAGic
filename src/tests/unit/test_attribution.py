@@ -129,7 +129,7 @@ def test_attribution_round_trips_to_disk(gateway, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     gateway.default_chat = gateway.chat_ok(
         "google", "gemini-2.5-pro",
-        content='[{"Title": "Login works", "Steps": ["open", "submit"]}]',
+        content='[{"title": "Login works", "steps": ["open", "submit"]}]',
     )
 
     agent = TestGeneratorAgent(model="auto")

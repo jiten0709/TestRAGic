@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- A local stand-in for "the application under test".
+     Every control is reachable by role and label, which is what the generated
+     suites use (get_by_role / get_by_label), so this page exercises the real
+     conversion path without depending on a third-party site. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Demo App</title></head>
+<body>
+  <h1>Demo App</h1>
+  <nav aria-label="main"><a href="#about">About</a></nav>
+
+  <form id="login-form" onsubmit="signIn(event)">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" />
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" />
+
+    <label for="terms">Terms</label>
+    <input id="terms" name="terms" type="checkbox" />
+
+    <button type="submit">Sign in</button>
+  </form>
+
+  <div id="result" hidden><h2>Dashboard</h2><p>Signed in successfully</p></div>
+
+  <script>
+    function signIn(event) {
+      event.preventDefault();
+      document.getElementById('login-form').hidden = true;
+      document.getElementById('result').hidden = false;
+    }
+  </script>
+</body>
+</html>

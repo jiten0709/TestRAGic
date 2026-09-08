@@ -215,6 +215,8 @@ github_openai.example.py
 src/data/test_cases/*
 src/data/test_data/*
 src/data/test_results/*
+src/data/generated_tests/*
+src/data/test_artifacts/*
 src/data/transcripts/*
 src/data/vector_store/*
 src/data/videos/*

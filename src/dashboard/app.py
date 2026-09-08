@@ -7,7 +7,11 @@ import plotly.express as px
 from pathlib import Path
 from src.agents import data_ingestion
 from src.agents.data_ingestion import DataIngestionAgent
-from src.agents.test_generator import TestGeneratorAgent
+from src.agents.test_generator import (
+    MAX_TEST_CASES, TestGeneratorAgent, allocate, normalise_cases,
+)
+from src.agents.test_executor import TestExecutorAgent
+from src.utils.playwright_converter import PlaywrightConverter
 from src.utils.config import (
     load_environment, get_openai_api_key, set_openai_api_key,
     get_gateway_base_url, set_gateway_base_url,
@@ -101,6 +105,12 @@ def initialize_session_state():
     
     if 'priority_levels' not in st.session_state:
         st.session_state.priority_levels = ["Critical", "High"]
+
+    if 'max_test_cases' not in st.session_state:
+        st.session_state.max_test_cases = 10
+
+    if 'priority_distribution' not in st.session_state:
+        st.session_state.priority_distribution = "Even"
     
     if 'llm_model' not in st.session_state:
         st.session_state.llm_model = provider.default_chat_model()
@@ -397,7 +407,33 @@ def render_test_generation_page():
                 key="priority_levels_input"
             )
             st.session_state.priority_levels = priority_levels
-            
+
+            # One call per category costs money and time, so the budget is for the
+            # whole suite. The floor tracks the category count: every selected
+            # category must get at least one case, and st.slider raises rather
+            # than clamps when its value falls below min_value.
+            floor = max(1, len(test_categories))
+            st.session_state.max_test_cases = st.slider(
+                "Max test cases (total):",
+                floor, MAX_TEST_CASES,
+                value=max(st.session_state.max_test_cases, floor),
+                key="max_test_cases_input",
+                help="Split evenly across the selected categories.",
+            )
+            st.session_state.priority_distribution = st.radio(
+                "Priority distribution:",
+                ["Even", "Weighted"],
+                horizontal=True,
+                index=["Even", "Weighted"].index(st.session_state.priority_distribution),
+                key="priority_distribution_input",
+                help="How each category's share is split across the priority levels "
+                     "above. Weighted: critical 4, high 3, medium 2, low 1.",
+            )
+            if test_categories:
+                st.caption("Per category: " + " · ".join(
+                    f"{c} {n}" for c, n in
+                    allocate(st.session_state.max_test_cases, test_categories).items()))
+
             chat_models, catalog_warning = provider.list_chat_models()
             model_options = [m["id"] for m in chat_models]
             if catalog_warning:
@@ -445,7 +481,9 @@ def render_test_generation_page():
                         st.session_state.video_url, 
                         st.session_state.test_categories, 
                         st.session_state.priority_levels, 
-                        st.session_state.llm_model
+                        st.session_state.llm_model,
+                        st.session_state.max_test_cases,
+                        st.session_state.priority_distribution.lower(),
                     )
             elif input_method == "Upload Video File" and uploaded_file:
                 with run_context(f"file={uploaded_file.name}"):
@@ -453,7 +491,9 @@ def render_test_generation_page():
                         uploaded_file, 
                         st.session_state.test_categories, 
                         st.session_state.priority_levels, 
-                        st.session_state.llm_model
+                        st.session_state.llm_model,
+                        st.session_state.max_test_cases,
+                        st.session_state.priority_distribution.lower(),
                     )
             else:
                 st.error("Please provide a video URL or upload a video file.")
@@ -594,7 +634,8 @@ def wire_retriever(test_agent, data_agent, video_content):
     )
 
 
-def generate_test_cases_from_url(url, categories, priorities, model):
+def generate_test_cases_from_url(url, categories, priorities, model,
+                                 max_cases=MAX_TEST_CASES, distribution="even"):
     """Generate test cases from YouTube URL"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -641,11 +682,10 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         status_text.text("🎬 Processing video...")
         progress_bar.progress(25)
         
-        # Add mock data option for testing
-        # NOTE: this substring match means any real URL containing "test" is
-        # silently swapped for canned input. Pre-existing bug, tracked separately;
-        # labelled here so a mock run is never mistaken for a real one.
-        used_mock_input = url == "test" or "test" in url.lower()
+        # Mock input is opt-in by typing exactly "test". This used to be
+        # `"test" in url.lower()`, which silently swapped canned data in for any
+        # real URL containing that substring (youtube.com/watch?v=...test...).
+        used_mock_input = url.strip().lower() == "test"
         if used_mock_input:
             video_content = test_with_mock_data()
             st.warning(
@@ -670,37 +710,23 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         status_text.text("🤖 Generating test cases...")
         progress_bar.progress(50)
         
-        # Try different method names based on what's available
+        # One generation entry point. The cascade that used to sit here tried
+        # generate_test_cases() and generate_tests(), neither of which exists.
         test_cases = None
-        
-        if hasattr(test_agent, 'generate_comprehensive_tests'):
-            try:
-                test_cases = test_agent.generate_comprehensive_tests(
-                    video_content, categories, priorities
-                )
-            except Exception as e:
-                logger.warning("generate_comprehensive_tests failed: %s", e, exc_info=True)
-                st.warning(f"generate_comprehensive_tests failed: {e}")
-        
-        if not test_cases and hasattr(test_agent, 'generate_test_cases'):
-            try:
-                test_cases = test_agent.generate_test_cases(
-                    video_content, categories, priorities
-                )
-            except Exception as e:
-                st.warning(f"generate_test_cases failed: {e}")
-        
-        if not test_cases and hasattr(test_agent, 'generate_tests'):
-            try:
-                test_cases = test_agent.generate_tests(video_content)
-            except Exception as e:
-                st.warning(f"generate_tests failed: {e}")
-        
-        # If no existing method works, create a basic test case structure
+        try:
+            test_cases = test_agent.generate_comprehensive_tests(
+                video_content, categories, priorities, max_cases, distribution
+            )
+        except Exception as e:
+            logger.warning("generate_comprehensive_tests failed: %s", e, exc_info=True)
+            st.warning(f"generate_comprehensive_tests failed: {e}")
+
+        # If generation produced nothing, create a basic test case structure
         if not test_cases:
             logger.warning("no generator method produced cases; using canned fallbacks")
             st.warning("Using fallback test generation...")
-            test_cases = create_fallback_test_cases(video_content, categories, priorities)
+            test_cases = create_fallback_test_cases(video_content, categories,
+                                                    priorities, max_cases)
         
         # Step 3: Format and save
         status_text.text("💾 Formatting and saving...")
@@ -771,7 +797,8 @@ def generate_test_cases_from_url(url, categories, priorities, model):
         4. Check your internet connection
         """)
 
-def create_fallback_test_cases(video_content, categories, priorities):
+def create_fallback_test_cases(video_content, categories, priorities,
+                               max_cases=MAX_TEST_CASES):
     """Create basic test cases when the TestGeneratorAgent fails"""
     
     # Extract basic info from video content
@@ -841,8 +868,10 @@ def create_fallback_test_cases(video_content, categories, priorities):
             ],
             'assertions': ['UI renders consistently', 'All features work across browsers']
         })
-    
-    return test_cases
+
+    # Canonical shape, like every other path -- these are displayed and executed
+    # by the same code as generated cases.
+    return normalise_cases(test_cases)[:max_cases]
 
 def render_attribution(metadata, prefix="🤖 Generated by"):
     """Render who actually answered.
@@ -884,10 +913,12 @@ def format_test_cases_fallback(test_cases, agent=None):
     attribution = provider.summarize(getattr(agent, '_attributions', None) or [])
 
     if isinstance(test_cases, dict) and 'test_cases' in test_cases:
+        test_cases['test_cases'] = normalise_cases(test_cases['test_cases'])
         test_cases.setdefault('metadata', {}).setdefault('attribution', attribution)
         return test_cases
 
-    cases = test_cases if isinstance(test_cases, list) else ([test_cases] if test_cases else [])
+    cases = normalise_cases(test_cases if isinstance(test_cases, list)
+                            else ([test_cases] if test_cases else []))
     return {
         'test_cases': cases,
         'metadata': {
@@ -898,7 +929,8 @@ def format_test_cases_fallback(test_cases, agent=None):
         }
     }
 
-def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
+def generate_test_cases_from_file(uploaded_file, categories, priorities, model,
+                                  max_cases=MAX_TEST_CASES, distribution="even"):
     """Generate test cases from uploaded video file"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -932,7 +964,7 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model):
         status_text.text("🤖 Generating test cases...")
         progress_bar.progress(50)
         test_cases = test_agent.generate_comprehensive_tests(
-            video_content, categories, priorities
+            video_content, categories, priorities, max_cases, distribution
         )
         
         # Step 3: Format and save
@@ -1000,57 +1032,34 @@ def display_generated_test_cases(test_cases, used_mock_input=False):
     tab1, tab2, tab3 = st.tabs(["📋 Test Cases", "📄 JSON Format", "📝 Markdown"])
     
     with tab1:
-        # Display test cases in a nice format
-        test_list = test_cases.get('test_cases', [])
-        
-        # Fix display numbering for duplicates
-        seen_ids = set()
-        display_counter = 1
-        
-        for i, tc in enumerate(test_list):
-            # Generate display ID
-            original_id = tc.get('ID', tc.get('id', f'TC{display_counter:03d}'))
-            
-            if original_id in seen_ids:
-                display_id = f"TC{display_counter:03d}"
-            else:
-                display_id = original_id
-                seen_ids.add(original_id)
-            
-            with st.expander(f"{display_id}: {tc.get('Title', tc.get('title', 'Untitled'))}", expanded=i < 3):
+        # One key schema: normalise_cases() guarantees lowercase keys, string
+        # steps and unique ids, so no .get('ID', .get('id', ...)) cascade here.
+        for i, tc in enumerate(test_cases.get('test_cases', [])):
+            with st.expander(f"{tc['id']}: {tc['title']}", expanded=i < 3):
                 col1, col2 = st.columns([3, 1])
-                
+
                 with col1:
-                    st.write(f"**Description:** {tc.get('Description', tc.get('description', 'No description'))}")
-                    st.write(f"**Category:** {tc.get('Category', tc.get('category', 'Unknown'))}")
-                    
-                    # Handle both Steps and steps
-                    steps = tc.get('Steps', tc.get('steps', []))
-                    if steps:
+                    st.write(f"**Description:** {tc['description'] or 'No description'}")
+                    st.write(f"**Category:** {tc['category'] or 'Unknown'}")
+
+                    if tc['steps']:
                         st.write("**Steps:**")
-                        if isinstance(steps, list) and isinstance(steps[0], dict):
-                            # Structured steps
-                            for step in steps:
-                                st.write(f"  {step.get('step', '')}. {step.get('action', step)}")
-                        else:
-                            # Simple string steps
-                            for j, step in enumerate(steps, 1):
-                                st.write(f"  {j}. {step}")
-                    
-                    # Handle assertions
-                    assertions = tc.get('Assertions', tc.get('assertions', []))
-                    if assertions:
+                        for j, step in enumerate(tc['steps'], 1):
+                            st.write(f"  {j}. {step}")
+
+                    if tc['expected_result']:
+                        st.write(f"**Expected result:** {tc['expected_result']}")
+
+                    if tc['assertions']:
                         st.write("**Assertions:**")
-                        for assertion in assertions:
+                        for assertion in tc['assertions']:
                             st.write(f"  • {assertion}")
-                
+
                 with col2:
                     priority_color = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
-                    priority = tc.get('Priority', tc.get('priority', 'Low')).lower()
-                    st.write(f"**Priority:** {priority_color.get(priority, '⚪')} {priority.title()}")
-                    st.write(f"**ID:** {display_id}")
-            
-            display_counter += 1
+                    st.write(f"**Priority:** {priority_color.get(tc['priority'], '⚪')} "
+                             f"{tc['priority'].title()}")
+                    st.write(f"**ID:** {tc['id']}")
     
     with tab2:
         st.json(test_cases)
@@ -1079,19 +1088,22 @@ def convert_to_markdown(test_cases):
     """Convert test cases to markdown format"""
     markdown = "# Test Cases\n\n"
     
-    for i, tc in enumerate(test_cases.get('test_cases', [])):
-        markdown += f"## TC{i+1:03d}: {tc.get('title', 'Untitled')}\n\n"
-        markdown += f"**Description:** {tc.get('description', 'No description')}\n\n"
-        markdown += f"**Category:** {tc.get('category', 'Unknown')}\n\n"
-        markdown += f"**Priority:** {tc.get('priority', 'Low').title()}\n\n"
-        
-        if tc.get('steps'):
+    for tc in normalise_cases(test_cases.get('test_cases', [])):
+        markdown += f"## {tc['id']}: {tc['title']}\n\n"
+        markdown += f"**Description:** {tc['description'] or 'No description'}\n\n"
+        markdown += f"**Category:** {tc['category'] or 'Unknown'}\n\n"
+        markdown += f"**Priority:** {tc['priority'].title()}\n\n"
+
+        if tc['steps']:
             markdown += "**Steps:**\n"
-            for step in tc['steps']:
-                markdown += f"{step.get('step', 0)}. {step.get('action', '')} - {step.get('expected', '')}\n"
+            for number, step in enumerate(tc['steps'], 1):
+                markdown += f"{number}. {step}\n"
             markdown += "\n"
+
+        if tc['expected_result']:
+            markdown += f"**Expected result:** {tc['expected_result']}\n\n"
         
-        if tc.get('assertions'):
+        if tc['assertions']:
             markdown += "**Assertions:**\n"
             for assertion in tc['assertions']:
                 markdown += f"- {assertion}\n"
@@ -1133,30 +1145,41 @@ def render_test_execution_page():
             default=file_options[:1] if file_options else []
         )
         
+        # The application under test. Test cases describe a flow, not a host, so
+        # without this every generated `page.goto()` lands on about:blank.
+        base_url = st.text_input(
+            "Application URL (tests run against this):",
+            value=os.getenv("BASE_URL", "http://localhost:3000"),
+            help="Playwright opens this URL. Relative paths in a step are resolved against it.",
+        )
+
         # Execution options
         with st.expander("🔧 Execution Options"):
+            # Exactly the three engines pytest-playwright's --browser accepts;
+            # the old list offered device profiles that were never wired up.
             browsers = st.multiselect(
                 "Target Browsers:",
-                ["Chromium", "Firefox", "Safari", "Mobile Chrome", "Mobile Safari"],
+                list(BROWSER_ENGINES),
                 default=["Chromium"]
             )
-            
-            headless = st.checkbox("Run in headless mode", value=False)
-            
-            parallel_execution = st.checkbox("Parallel execution", value=True)
-            
+
+            headless = st.checkbox("Run in headless mode", value=True)
+
             capture_options = st.multiselect(
                 "Capture on failure:",
-                ["Screenshots", "Videos", "Traces", "Logs"],
-                default=["Screenshots", "Logs"]
+                ["Screenshots", "Videos", "Traces"],
+                default=["Screenshots", "Traces"]
             )
-        
+
         # Execute button
         if st.button("🎬 Execute Tests", type="primary", use_container_width=True):
-            if selected_files:
-                execute_playwright_tests(selected_files, browsers, headless, parallel_execution, capture_options)
-            else:
+            if not selected_files:
                 st.error("Please select at least one test file.")
+            elif not base_url.strip():
+                st.error("Enter the URL of the application to test.")
+            else:
+                execute_playwright_tests(selected_files, browsers, headless,
+                                         base_url.strip(), capture_options)
     
     with col2:
         st.subheader("📊 Execution Status")
@@ -1197,7 +1220,11 @@ def save_test_execution_results(execution_results, test_files):
             "timestamp": datetime.datetime.now().isoformat(),
             "test_files": test_files,
             "summary": execution_results,
-            "detailed_results": st.session_state.get('execution_log', []),
+            # The per-test rows the Results page tabulates. This used to save the
+            # log strings under this key, so a reloaded run showed log lines in
+            # the results table.
+            "detailed_results": execution_results.get('detailed_results', []),
+            "execution_log": st.session_state.get('execution_log', []),
             "browser_results": {},
             "performance_metrics": {
                 "total_duration": execution_results.get('duration', 0),
@@ -1230,126 +1257,145 @@ def save_test_execution_results(execution_results, test_files):
         st.warning(f"Could not save execution results: {e}")
         return None
     
-def execute_playwright_tests(selected_files, browsers, headless, parallel_execution, capture_options):
-    """Execute Playwright tests"""
+# Streamlit's browser labels -> the engines pytest-playwright actually accepts.
+BROWSER_ENGINES = {"Chromium": "chromium", "Firefox": "firefox", "WebKit": "webkit"}
+
+
+def execute_playwright_tests(selected_files, browsers, headless, base_url, capture_options):
+    """Convert the selected test cases to a Playwright suite and run it for real.
+
+    Three stages, each able to fail visibly: normalise the saved cases, convert
+    them to pytest modules (PlaywrightConverter), run those modules in a pytest
+    subprocess (TestExecutorAgent). What lands in session state is what the
+    browser did -- this function used to `time.sleep(0.3)` and
+    `random.choice([True]*9 + [False])`, so every chart on the Results page was
+    fabricated.
+    """
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     try:
-        status_text.text("🎬 Initializing test execution...")
-        progress_bar.progress(10)
-        
-        # Load actual test cases from selected files
-        all_test_cases = []
+        status_text.text("📖 Loading test cases...")
+        raw_cases = []
         for file_name in selected_files:
-            test_cases = load_test_cases_from_file(file_name)
-            all_test_cases.extend(test_cases)
-        
+            raw_cases.extend(load_test_cases_from_file(file_name))
+
+        # Saved files predate the canonical schema, so normalise on the way in.
+        all_test_cases = normalise_cases(raw_cases)
         if not all_test_cases:
             logger.error("execution aborted: no test cases in %s", selected_files)
             st.error("No test cases found in selected files")
             return
 
-        logger.info("executing %d test cases on %s (simulated)", len(all_test_cases), browsers)
-        
-        # Calculate total tests: test cases × browsers
-        total_tests = len(all_test_cases) * len(browsers)
-        executed = 0
-        passed = 0
-        failed = 0
-        
+        engines = [BROWSER_ENGINES[b] for b in browsers if b in BROWSER_ENGINES] or ["chromium"]
+
+        status_text.text("🧪 Converting test cases to Playwright...")
+        progress_bar.progress(10)
+        converter = PlaywrightConverter()
+        suite_name = Path(selected_files[0]).stem if selected_files else "suite"
+        suite = converter.generate_complete_test_suite(all_test_cases, suite_name, base_url)
+
+        if not suite.get("success") or not suite.get("test_files"):
+            logger.error("conversion produced no runnable suite: %s", suite.get("error"))
+            st.error(f"❌ Could not convert test cases to Playwright: {suite.get('error', 'no files written')}")
+            return
+
+        case_index = suite.get("case_index", {})
+        st.caption(f"🧾 Wrote {len(suite['test_files'])} suite file(s) to "
+                   f"`{converter.generated_tests_dir}`")
+
+        capture = tuple(option.lower() for option in capture_options)
+        executor = TestExecutorAgent()
+
+        executed = passed = failed = skipped = 0
+        duration = 0.0
         execution_log = []
         detailed_results = []
-        
-        # Execute each test case on each browser
-        for test_case in all_test_cases:
-            test_id = test_case.get('ID', test_case.get('id', f'TC{executed+1:03d}'))
-            test_title = test_case.get('Title', test_case.get('title', 'Unknown Test'))
-            test_priority = test_case.get('Priority', test_case.get('priority', 'Medium'))
-            
-            for browser in browsers:
-                status_text.text(f"🔄 Running {test_id}: {test_title} on {browser}...")
-                
-                # Simulate execution time
-                import time
-                import random
-                time.sleep(0.3)  # Simulate test execution
-                
-                # Simulate test result (90% pass rate)
-                test_passed = random.choice([True] * 9 + [False])
-                execution_duration = round(random.uniform(0.5, 3.0), 1)
-                
+
+        for position, engine in enumerate(engines, 1):
+            status_text.text(f"🎬 Running {len(all_test_cases)} test cases on {engine}...")
+            run = executor.execute_tests(suite["test_files"], browser=engine,
+                                         headless=headless, base_url=base_url,
+                                         capture=capture)
+            duration += run.get("duration", 0.0)
+
+            if run.get("status") != "completed":
+                message = run.get("error", "unknown error")
+                execution_log.append(f"⛔️ {engine}: {message}")
+                st.error(f"❌ {engine}: {message}")
+
+            for case in run.get("test_results", []):
+                origin = case_index.get(case["name"], {})
+                test_id = origin.get("id") or case["name"]
+                title = origin.get("title") or case["name"]
+                symbol = {"passed": "✅", "failed": "❌"}.get(case["status"], "⏭️")
+
                 executed += 1
-                
-                if test_passed:
+                if case["status"] == "passed":
                     passed += 1
-                    status_msg = "PASSED"
-                    error_msg = ""
-                    execution_log.append(f"✅ {test_id} - {browser}: PASSED ({execution_duration}s)")
-                else:
+                elif case["status"] == "failed":
                     failed += 1
-                    status_msg = "FAILED"
-                    error_msg = random.choice([
-                        "Element not found: #submit-button",
-                        "Timeout waiting for page load",
-                        "Assertion failed: Expected 'Success' but got 'Error'",
-                        "Network error: Connection timeout"
-                    ])
-                    execution_log.append(f"❌ {test_id} - {browser}: FAILED - {error_msg}")
-                
-                # Add to detailed results
+                else:
+                    skipped += 1
+
+                execution_log.append(
+                    f"{symbol} {test_id} - {engine}: {case['status'].upper()} "
+                    f"({case['duration']:.1f}s)" + (f" - {case['error']}" if case['error'] else "")
+                )
                 detailed_results.append({
                     "Test Case": test_id,
-                    "Test Title": test_title,
-                    "Status": status_msg,
-                    "Browser": browser,
-                    "Priority": test_priority.title(),
-                    "Duration": f"{execution_duration}s",
-                    "Error": error_msg
+                    "Test Title": title,
+                    "Status": case["status"].title(),
+                    "Browser": engine.title(),
+                    "Priority": (origin.get("priority") or "medium").title(),
+                    "Duration": f"{case['duration']:.1f}s",
+                    "Error": case["error"],
                 })
-                
-                # Update progress
-                progress = int((executed / total_tests) * 90) + 10
-                progress_bar.progress(min(progress, 100))
-        
+
+            progress_bar.progress(min(10 + int(position / len(engines) * 90), 100))
+
         status_text.text("✅ Test execution completed!")
         progress_bar.progress(100)
-        
-        # Update session state with comprehensive results
+
         st.session_state.execution_status = {
             'executed': executed,
             'passed': passed,
             'failed': failed,
-            'duration': executed * 0.8,
+            'skipped': skipped,
+            'duration': duration,
             'total_test_cases': len(all_test_cases),
-            'browsers_tested': len(browsers)
+            'browsers_tested': len(engines),
+            'simulated': False,
         }
-        
         st.session_state.execution_log = execution_log
         st.session_state.detailed_results = detailed_results
-        
-        # Save results to file
+
         save_test_execution_results({
             'executed': executed,
             'passed': passed,
             'failed': failed,
-            'duration': executed * 0.8,
-            'detailed_results': detailed_results
+            'skipped': skipped,
+            'duration': duration,
+            'simulated': False,
+            'base_url': base_url,
+            'suite_files': suite["test_files"],
+            'detailed_results': detailed_results,
         }, selected_files)
-        
-        # Show summary
-        logger.info("execution finished: %d passed, %d failed of %d runs", passed, failed, executed)
-        if failed > 0:
-            st.warning(f"Test execution completed: {passed} passed, {failed} failed")
-        else:
-            st.success(f"All {passed} tests passed! 🎉")
-        
-        # Show execution summary
-        st.info(f"Executed {len(all_test_cases)} test cases across {len(browsers)} browsers = {executed} total test runs")
-        
+
+        logger.info("execution finished: %d passed, %d failed, %d skipped of %d runs",
+                    passed, failed, skipped, executed)
+        if failed:
+            st.warning(f"Test execution completed: {passed} passed, {failed} failed, {skipped} skipped")
+        elif executed:
+            st.success(f"All {passed} executed tests passed! 🎉")
+        if skipped:
+            st.info(f"⏭️ {skipped} test(s) were skipped — a step or assertion could not be "
+                    "converted to Playwright. The skip message names the step.")
+
     except Exception as e:
         logger.error("test execution failed: %s", e, exc_info=True)
         st.error(f"Error executing tests: {str(e)}")
+    finally:
         progress_bar.empty()
         status_text.empty()
 
@@ -1418,9 +1464,16 @@ def render_results_page():
             st.info("Execute tests first to see results")
         return
     
+    if results.get('simulated', True):
+        st.warning(
+            "🎲 **These results are simulated.** They were recorded before test "
+            "execution ran a real browser (pass/fail was `random.choice`). Re-run "
+            "the suite from the Execution page to replace them with real results."
+        )
+
     # Overview metrics
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         st.metric("Total Tests", results.get('total_tests', 0))
     with col2:
@@ -1433,7 +1486,13 @@ def render_results_page():
         st.metric("Failed", failed, delta=failed_delta)
     with col4:
         success_rate = (passed / (passed + failed) * 100) if (passed + failed) > 0 else 0
-        st.metric("Success Rate", f"{success_rate:.1f}%")
+        st.metric("Success Rate", f"{success_rate:.1f}%",
+                  help="Skipped tests are excluded; a skip means a step could not "
+                       "be converted to Playwright.")
+
+    if results.get('skipped'):
+        st.info(f"⏭️ {results['skipped']} test(s) skipped — see the Error column for "
+                "the step or assertion that could not be converted.")
     
     # Charts
     st.subheader("📈 Test Results Trends")
@@ -1512,43 +1571,6 @@ def render_results_page():
             st.button("📄 Generate PDF Report", help="PDF report generation coming soon!")
     else:
         st.info("No results match the selected filters.")
-
-def fix_duplicate_test_ids():
-    """Fix duplicate test case IDs in existing files"""
-    st.subheader("🔧 Fix Duplicate Test IDs")
-    
-    test_files = load_available_test_files()
-    
-    if st.button("🔄 Fix Duplicate IDs in All Files"):
-        fixed_count = 0
-        
-        for test_file in test_files:
-            if test_file['path'] != 'session_state':
-                try:
-                    # Load the file
-                    with open(test_file['path'], 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    
-                    # Fix duplicate IDs
-                    test_cases = data.get('test_cases', [])
-                    for i, test_case in enumerate(test_cases, 1):
-                        test_case['ID'] = f"TC{i:03d}"
-                    
-                    # Update metadata
-                    data['metadata']['fixed_at'] = datetime.datetime.now().isoformat()
-                    data['metadata']['total_cases'] = len(test_cases)
-                    
-                    # Save back to file
-                    with open(test_file['path'], 'w', encoding='utf-8') as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                    
-                    fixed_count += 1
-                    
-                except Exception as e:
-                    st.error(f"Error fixing {test_file['name']}: {e}")
-        
-        st.success(f"✅ Fixed {fixed_count} test files!")
-        st.rerun()
 
 def render_ai_provider_settings():
     """The single place the provider, the models and the credentials are chosen."""
@@ -1792,15 +1814,19 @@ def load_test_results():
             except Exception as e:
                 st.warning(f"Could not load {file_path.name}: {e}")
     
+    file_results.sort(key=lambda r: r.get('timestamp', ''))
+
     # Return most recent or session results
     if session_results:
         return {
             'total_tests': session_results.get('executed', 0),
             'passed': session_results.get('passed', 0),
             'failed': session_results.get('failed', 0),
+            'skipped': session_results.get('skipped', 0),
             'passed_delta': 0,
             'failed_delta': 0,
-            'detailed_results': detailed_results,  # ✅ USE REAL DATA HERE
+            'simulated': session_results.get('simulated', True),
+            'detailed_results': detailed_results,
             'historical_results': file_results
         }
     elif file_results:
@@ -1810,41 +1836,41 @@ def load_test_results():
             'total_tests': summary.get('executed', 0),
             'passed': summary.get('passed', 0),
             'failed': summary.get('failed', 0),
+            'skipped': summary.get('skipped', 0),
             'passed_delta': 0,
             'failed_delta': 0,
+            # Runs written before execution was real carry no flag, and every one
+            # of them was simulated. Absence means simulated, never "assume real".
+            'simulated': summary.get('simulated', True),
             'detailed_results': latest.get('detailed_results', []),
             'historical_results': file_results
         }
-    
+
     return None
 
-def generate_sample_detailed_results(status):
-    """Generate sample detailed results for display"""
-    results = []
-    
-    for i in range(status.get('executed', 0)):
-        results.append({
-            'Test Case': f"TC{i+1:03d}",
-            'Status': 'Passed' if i < status.get('passed', 0) else 'Failed',
-            'Browser': ['Chromium', 'Firefox', 'Safari'][i % 3],
-            'Priority': ['Critical', 'High', 'Medium', 'Low'][i % 4],
-            'Duration': f"{(i % 10) + 1}.{(i % 9) + 1}s",
-            'Error': '' if i < status.get('passed', 0) else 'Element not found'
-        })
-    
-    return results
-
 def create_trend_chart_data(results):
-    """Create sample trend data for charts"""
-    from datetime import datetime, timedelta
-    
-    dates = [(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7, 0, -1)]
-    
-    return pd.DataFrame({
-        'date': dates,
-        'passed': [15, 18, 20, 16, 22, 19, results.get('passed', 0)],
-        'failed': [3, 2, 1, 4, 2, 3, results.get('failed', 0)]
-    })
+    """Trend over the runs actually saved in src/data/test_results.
+
+    This used to return five hardcoded numbers plus the current run, so the
+    "Test Results Over Time" chart showed history that never happened.
+    """
+    rows = []
+    for record in results.get('historical_results', []):
+        summary = record.get('summary', {})
+        rows.append({
+            'date': (record.get('timestamp') or '')[:19].replace('T', ' '),
+            'passed': summary.get('passed', 0),
+            'failed': summary.get('failed', 0),
+            'simulated': summary.get('simulated', True),
+        })
+
+    if not rows:
+        rows = [{'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                 'passed': results.get('passed', 0),
+                 'failed': results.get('failed', 0),
+                 'simulated': results.get('simulated', True)}]
+
+    return pd.DataFrame(rows)
 
 def apply_filters(results, status_filter, browser_filter, priority_filter):
     """Apply filters to test results"""

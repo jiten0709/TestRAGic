@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The gate: pure Python, no browser, no network, a few seconds.
+      - name: Unit tests
+        run: pytest src/tests/unit -o addopts="" -q
+
+      # Guards the generate -> convert -> execute pipeline against the committed
+      # fixture page. Chromium only: the other engines add minutes and test the
+      # same conversion logic.
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Browser tests
+        # pytest.ini's addopts already pin --browser chromium; passing it
+        # again appends a second engine and runs everything twice.
+        run: pytest src/tests/generated -q

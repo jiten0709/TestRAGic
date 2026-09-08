@@ -33,8 +33,9 @@ def test_nested_json_is_no_longer_discarded(gateway):
     cases = agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
 
     assert len(cases) == 1
-    assert cases[0]["Title"] == "Sign up with a valid email"
-    assert cases[0]["Steps"][0]["action"] == "open signup", "nested steps survived"
+    assert cases[0]["title"] == "Sign up with a valid email"
+    assert cases[0]["steps"] == ["open signup"], "nested steps survived, flattened to text"
+    assert cases[0]["expected_result"] == "form shown", "a step's `expected` is not lost"
     assert cases[0]["category"] == "ui"
 
 
@@ -44,13 +45,13 @@ def test_a_test_cases_envelope_is_unwrapped(gateway):
     )
     cases = TestGeneratorAgent(model="auto").generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
 
-    assert [c["Title"] for c in cases] == ["A", "B"]
+    assert [c["title"] for c in cases] == ["A", "B"]
 
 
 def test_a_bare_object_is_accepted(gateway):
     gateway.default_chat = gateway.chat_ok(content='{"Title": "Only one"}')
     cases = TestGeneratorAgent(model="auto").generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
-    assert [c["Title"] for c in cases] == ["Only one"]
+    assert [c["title"] for c in cases] == ["Only one"]
 
 
 def test_prose_with_no_json_produces_one_labelled_stub(gateway):
@@ -116,10 +117,12 @@ def test_the_agent_constructs_no_client_and_needs_no_key():
     assert agent._attributions == []
 
 
-def test_the_legacy_single_flow_path_is_explicitly_not_wired(gateway):
-    result = TestGeneratorAgent(model="auto").generate_test_cases("some flow")
-    assert result["success"] is False
-    assert "generate_comprehensive_tests" in result["error"]
+def test_the_legacy_single_flow_path_is_gone(gateway):
+    """The dead generate_test_cases / self.llm block is deleted, not just guarded."""
+    agent = TestGeneratorAgent(model="auto")
+    for gone in ("generate_test_cases", "create_edge_cases", "add_accessibility_tests",
+                 "format_output", "_parse_fallback_response", "generate_unique_test_ids"):
+        assert not hasattr(agent, gone), f"{gone} is dead code and must stay deleted"
     assert gateway.chat_models_called == []
 
 
