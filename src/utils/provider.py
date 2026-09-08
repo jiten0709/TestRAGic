@@ -20,6 +20,7 @@ catalog GET uses `httpx`.
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -384,7 +385,8 @@ ENGLISH_ONLY = (
 
 
 def chat(prompt: str, model: str | None = None, temperature: float = 0.3,
-         max_tokens: int = 4000, system: str | None = ENGLISH_ONLY) -> tuple[str, Attribution]:
+         max_tokens: int = 4000, system: str | None = ENGLISH_ONLY,
+         images: list[bytes] | None = None) -> tuple[str, Attribution]:
     """One chat completion, with the outer fallback chain.
 
     `system` defaults to ENGLISH_ONLY: the gateway's `auto` route reaches
@@ -392,17 +394,36 @@ def chat(prompt: str, model: str | None = None, temperature: float = 0.3,
     suite came back in Chinese from an English transcript. Pass system=None to
     opt out.
 
+    `images` are JPEG bytes sent as OpenAI-style `image_url` content parts, which
+    is how the OCR path captions a frame. Vision is not a second call path: it
+    inherits the attribution, the English-only system prompt and the error
+    classification from here.
+
+    **A request carrying images does not fall back.** The chain would otherwise
+    descend to the text default and then to `auto`, sending an image to models that
+    may not accept one -- and on the gateway this was built against, every `auto/*`
+    route answers 502 while a directly-named model served the same image. Spending
+    the whole budget re-asking is worse than failing on the model that was named.
+
     Raises ProviderError only when every rung failed.
     """
     ep = resolve_endpoint()
     requested = _normalize(model or default_chat_model(), ep.gateway)
-    tail = [default_chat_model(), "auto" if ep.gateway == "omniroute" else None]
+    tail = [] if images else [default_chat_model(), "auto" if ep.gateway == "omniroute" else None]
     chain = _chain(requested, tail)
+
+    content: Any = prompt
+    if images:
+        content = [{"type": "text", "text": prompt}] + [
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(i).decode()}}
+            for i in images
+        ]
 
     messages: list[dict[str, Any]] = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": content})
 
     attempts: list[tuple[str, str]] = []
     for candidate in chain:

@@ -3,6 +3,7 @@ aiohttp==3.12.13
 aiosignal==1.4.0
 altair==5.5.0
 annotated-types==0.7.0
+antlr4-python3-runtime==4.9.3
 anyio==4.9.0
 attrs==25.3.0
 backoff==2.2.1
@@ -14,6 +15,7 @@ certifi==2025.6.15
 charset-normalizer==3.4.2
 click==8.5.0
 coloredlogs==15.0.1
+colorlog==6.12.0
 dataclasses-json==0.6.7
 defusedxml==0.7.1
 distro==1.9.0
@@ -70,6 +72,7 @@ nltk==3.9.1
 numba==0.61.2
 numpy==2.2.6
 oauthlib==3.3.1
+omegaconf==2.3.1
 onnxruntime==1.22.0
 openai-whisper==20250625
 openai==1.93.0
@@ -85,6 +88,7 @@ overrides==7.7.0
 packaging==24.2
 pandas==2.3.0
 pillow==11.3.0
+platformdirs==4.11.7
 playwright==1.53.0
 plotly==6.2.0
 pluggy==1.6.0
@@ -95,6 +99,7 @@ pyarrow==20.0.0
 pyasn1-modules==0.4.2
 pyasn1==0.6.1
 pybase64==1.4.1
+pyclipper==1.4.0
 pydantic-core==2.33.2
 pydantic-settings==2.10.1
 pydantic==2.11.7
@@ -117,6 +122,7 @@ python-slugify==8.0.4
 pytube==15.0.0
 pytz==2025.2
 pyyaml==6.0.2
+rapidocr==3.9.2
 referencing==0.36.2
 regex==2026.9.3
 requests-oauthlib==2.0.0
@@ -126,10 +132,12 @@ rich==14.0.0
 rpds-py==0.26.0
 rsa==4.9.1
 safetensors==0.8.0
+scenedetect==0.7.1
 scikit-learn==1.7.0
 scipy==1.16.0
 sentence-transformers==6.0.1
 setuptools==80.9.0
+shapely==2.1.2
 shellingham==1.5.4
 six==1.17.0
 smmap==5.0.2

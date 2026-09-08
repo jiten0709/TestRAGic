@@ -174,7 +174,9 @@ def test_a_silent_video_is_named_as_the_cause(warnings):
     })
 
     assert "no audio track" in warnings[0]
-    assert "never looks at the picture" in warnings[0]
+    # Reaching the placeholder for a silent video now means OCR failed too -- the
+    # hint has to say that, not the old "the pipeline never looks at the picture".
+    assert "OCR" in warnings[0]
 
 
 def test_a_missing_ffmpeg_is_named_as_the_cause(warnings):

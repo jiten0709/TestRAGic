@@ -54,6 +54,20 @@ def _brief(exc, limit: int = 240) -> str:
 NO_AUDIO = "no_audio"
 FFMPEG_MISSING = "ffmpeg_missing"
 
+# Transcript methods that came from reading the picture rather than hearing the
+# audio. `app.py::notice_if_ocr_transcript` switches on these.
+OCR_METHODS = ("ocr", "ocr+vision")
+
+
+def _merge_segments(spoken: List[Dict], seen: List[Dict]) -> List[Dict]:
+    """Speech and on-screen text as one stream, in the order they happened.
+
+    `_intelligent_chunking` walks segments in order and splits on action keywords,
+    so interleaving by timestamp puts "now click submit" next to the SUBMIT it
+    reads off the screen, in the same chunk.
+    """
+    return sorted([*(spoken or []), *(seen or [])], key=lambda s: float(s.get("start", 0)))
+
 
 DEFAULT_STORE_KEY = "default"
 
@@ -153,7 +167,7 @@ class DataIngestionAgent:
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Created directories: {self.videos_dir}, {self.transcripts_dir}")
     
-    def process_video_content(self, video_url: str) -> Dict:
+    def process_video_content(self, video_url: str, force_ocr: bool = False) -> Dict:
         """Process video and store in vector database"""
         try:
             logger.info(f"Processing video: {video_url}")
@@ -169,7 +183,7 @@ class DataIngestionAgent:
                 return {"success": False, "error": "No video ID found"}
             
             video_path = download_result.get("video_path")
-            transcript_result = self._extract_transcript(video_id, video_path)
+            transcript_result = self._extract_transcript(video_id, video_path, force_ocr)
             
             if not transcript_result.get("success", False):
                 return transcript_result
@@ -188,6 +202,7 @@ class DataIngestionAgent:
                 "transcript_method": transcript_result.get("method"),
                 "transcript_reason": transcript_result.get("reason"),
                 "transcript_cause": transcript_result.get("cause"),
+                "ocr_info": transcript_result.get("ocr"),
                 "chunks": chunks,
                 "vector_store_info": vectorize_result
             }
@@ -203,6 +218,7 @@ class DataIngestionAgent:
                 "transcript_method": transcript_result.get("method"),
                 "transcript_reason": transcript_result.get("reason"),
                 "transcript_cause": transcript_result.get("cause"),
+                "ocr_info": transcript_result.get("ocr"),
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
@@ -364,44 +380,107 @@ class DataIngestionAgent:
         
         return None
     
-    def _extract_transcript(self, video_id: str, video_path: str = None) -> Dict:
-        """Extract transcript with fallback methods"""
+    def _extract_transcript(self, video_id: str, video_path: str = None,
+                            force_ocr: bool = False) -> Dict:
+        """Extract transcript with fallback methods.
+
+        OCR sits between the real methods and the placeholder: a silent screen
+        recording has nothing to hear but plenty to read. `force_ocr` runs it even
+        when speech *was* found, merging both streams by timestamp.
+        """
         try:
             # Why each real method failed, so the synthetic fallback can say so
             # instead of being indistinguishable from a genuine transcript.
             reasons = []
             cause = None
+            spoken = None
 
             # Method 1: Try YouTube transcript API first
             try:
                 logger.info("Attempting to get transcript from YouTube API...")
                 transcript_data = self._get_youtube_transcript(video_id)
                 if transcript_data["success"]:
-                    return transcript_data
-                reasons.append(f"YouTube captions: {_brief(transcript_data.get('error', 'unavailable'))}")
+                    spoken = transcript_data
+                else:
+                    reasons.append(f"YouTube captions: {_brief(transcript_data.get('error', 'unavailable'))}")
             except Exception as e:
                 logger.warning(f"YouTube transcript API failed: {e}")
                 reasons.append(f"YouTube captions: {_brief(e)}")
-            
+
             # Method 2: Try Whisper if video file exists
-            if video_path and Path(video_path).exists():
-                try:
-                    logger.info("Attempting Whisper transcription...")
-                    return self._get_whisper_transcript(video_path)
-                except Exception as e:
-                    logger.warning(f"Whisper transcription failed: {e}")
-                    reasons.append(f"Whisper: {_brief(e)}")
-                    cause = cause or _classify_transcript_failure(e)
-            else:
-                reasons.append("Whisper: the video could not be downloaded")
-            
-            # Method 3: Create basic transcript from video metadata
-            logger.info("Creating basic transcript from available data...")
-            return self._create_basic_transcript(video_id, "; ".join(reasons), cause)
-            
+            if spoken is None:
+                if video_path and Path(video_path).exists():
+                    try:
+                        logger.info("Attempting Whisper transcription...")
+                        spoken = self._get_whisper_transcript(video_path)
+                    except Exception as e:
+                        logger.warning(f"Whisper transcription failed: {e}")
+                        reasons.append(f"Whisper: {_brief(e)}")
+                        cause = cause or _classify_transcript_failure(e)
+                else:
+                    reasons.append("Whisper: the video could not be downloaded")
+
+            # Method 3: OCR the picture; Method 4: the placeholder, unchanged.
+            return self._with_ocr(
+                spoken, video_path, force_ocr, reasons, cause,
+                lambda reason, why: self._create_basic_transcript(video_id, reason, why),
+            )
+
         except Exception as e:
             logger.error(f"All transcript methods failed: {str(e)}")
             return {"success": False, "error": str(e)}
+
+    def _with_ocr(self, spoken, video_path, force_ocr, reasons, cause, fallback) -> Dict:
+        """Decide what reading the picture contributes: everything, a merge, or nothing.
+
+        Shared by both ingestion paths so the rule lives in one place -- patching only
+        the upload path would leave a silent YouTube download just as blind.
+        """
+        seen = self._ocr_transcript(video_path, reasons) if (force_ocr or spoken is None) else None
+
+        if spoken and seen:
+            segments = _merge_segments(spoken.get("segments"), seen["segments"])
+            merged = dict(spoken)
+            merged.update({
+                "segments": segments,
+                # Rebuilt, not concatenated: `transcript` is what the generator falls
+                # back to without a retriever, so the read text has to be *in* it.
+                "transcript": "\n\n".join(str(s.get("text", "")).strip() for s in segments),
+                "method": f"{spoken.get('method') or 'audio'}+ocr",
+                "ocr": seen.get("ocr"),
+            })
+            return merged
+        if seen:
+            return seen
+        if spoken:
+            if force_ocr:
+                # The box was ticked and reading the picture produced nothing. Return
+                # the speech, but carry *why* -- a request that quietly does nothing is
+                # indistinguishable from one that worked.
+                return dict(spoken, ocr={"error": reasons[-1] if reasons else "OCR produced nothing"})
+            return spoken
+
+        logger.info("Creating basic transcript from available data...")
+        return fallback("; ".join(reasons), cause)
+
+    def _ocr_transcript(self, video_path: str | None, reasons: List[str]) -> Dict | None:
+        """Read the video's picture, or None -- recording *why* not, either way.
+
+        Imported here rather than at module scope: `import rapidocr` alone costs 2s
+        and this module is already the app's slowest import.
+        """
+        if not video_path or not Path(video_path).exists():
+            reasons.append("OCR: no local video file to read")
+            return None
+        try:
+            from src.utils import video_ocr
+
+            logger.info("Attempting OCR of on-screen text...")
+            return video_ocr.transcript_from_video(video_path)
+        except Exception as e:
+            logger.warning(f"OCR failed: {e}")
+            reasons.append(f"OCR: {_brief(e)}")
+            return None
 
     def _get_youtube_transcript(self, video_id: str) -> Dict:
         """Get transcript using YouTube Transcript API"""
@@ -662,7 +741,7 @@ class DataIngestionAgent:
         ]
         return any(indicator in current_text.lower() for indicator in topic_indicators)
     
-    def process_video_file(self, file_path: str) -> Dict:
+    def process_video_file(self, file_path: str, force_ocr: bool = False) -> Dict:
         """Process uploaded video file and store in vector database"""
         try:
             logger.info(f"Processing uploaded video file: {file_path}")
@@ -683,7 +762,7 @@ class DataIngestionAgent:
             }
             
             # Step 2: Extract transcript using Whisper
-            transcript_result = self._extract_transcript_from_file(file_path)
+            transcript_result = self._extract_transcript_from_file(file_path, force_ocr)
             
             if not transcript_result.get("success", False):
                 return transcript_result
@@ -701,6 +780,7 @@ class DataIngestionAgent:
                 "transcript_method": transcript_result.get("method"),
                 "transcript_reason": transcript_result.get("reason"),
                 "transcript_cause": transcript_result.get("cause"),
+                "ocr_info": transcript_result.get("ocr"),
                 "chunks": chunks,
                 "vector_store_info": vectorize_result
             }
@@ -716,6 +796,7 @@ class DataIngestionAgent:
                 "transcript_method": transcript_result.get("method"),
                 "transcript_reason": transcript_result.get("reason"),
                 "transcript_cause": transcript_result.get("cause"),
+                "ocr_info": transcript_result.get("ocr"),
                 "chunks": chunks,
                 "chunks_count": len(chunks),
                 "vector_store_info": vectorize_result,
@@ -729,22 +810,25 @@ class DataIngestionAgent:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return {"success": False, "error": str(e)}
 
-    def _extract_transcript_from_file(self, file_path: str) -> Dict:
+    def _extract_transcript_from_file(self, file_path: str, force_ocr: bool = False) -> Dict:
         """Extract transcript from uploaded video file"""
         try:
             # Method 1: Try Whisper transcription
-            reason, cause = "", None
+            reasons, cause, spoken = [], None, None
             try:
                 logger.info(f"Attempting Whisper transcription for uploaded file: {file_path}")
-                return self._get_whisper_transcript_direct(file_path)
+                spoken = self._get_whisper_transcript_direct(file_path)
             except Exception as e:
                 logger.warning(f"Whisper transcription failed: {e}")
-                reason, cause = _brief(e), _classify_transcript_failure(e)
-            
-            # Method 2: Create basic transcript based on file
-            logger.info("Creating basic transcript for uploaded video...")
-            return self._create_basic_transcript_for_file(file_path, reason, cause)
-            
+                reasons.append(_brief(e))
+                cause = _classify_transcript_failure(e)
+
+            # Method 2: OCR the picture; Method 3: the placeholder, unchanged.
+            return self._with_ocr(
+                spoken, file_path, force_ocr, reasons, cause,
+                lambda reason, why: self._create_basic_transcript_for_file(file_path, reason, why),
+            )
+
         except Exception as e:
             logger.error(f"All transcript methods failed for uploaded file: {str(e)}")
             return {"success": False, "error": str(e)}

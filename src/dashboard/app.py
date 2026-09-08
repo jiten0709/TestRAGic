@@ -429,6 +429,17 @@ def render_test_generation_page():
                 help="How each category's share is split across the priority levels "
                      "above. Weighted: critical 4, high 3, medium 2, low 1.",
             )
+            # Reading the picture is automatic when transcription fails; this asks
+            # for it even when the audio *did* produce words, which is the case a
+            # narrator who never names the buttons they are clicking leaves open.
+            st.session_state.force_ocr = st.checkbox(
+                "🔎 Also read on-screen text (OCR)",
+                value=st.session_state.get("force_ocr", False),
+                key="force_ocr_input",
+                help="Samples keyframes on visual change and reads their text locally. "
+                     "Runs automatically when transcription fails, whatever this says.",
+            )
+
             if test_categories:
                 st.caption("Per category: " + " · ".join(
                     f"{c} {n}" for c, n in
@@ -484,6 +495,7 @@ def render_test_generation_page():
                         st.session_state.llm_model,
                         st.session_state.max_test_cases,
                         st.session_state.priority_distribution.lower(),
+                        st.session_state.get("force_ocr", False),
                     )
             elif input_method == "Upload Video File" and uploaded_file:
                 with run_context(f"file={uploaded_file.name}"):
@@ -494,6 +506,7 @@ def render_test_generation_page():
                         st.session_state.llm_model,
                         st.session_state.max_test_cases,
                         st.session_state.priority_distribution.lower(),
+                        st.session_state.get("force_ocr", False),
                     )
             else:
                 st.error("Please provide a video URL or upload a video file.")
@@ -588,9 +601,9 @@ def warn_if_synthetic_transcript(video_content):
     # and the decisive line is exactly what gets trimmed out.
     hint = {
         data_ingestion.NO_AUDIO:
-            "\n\nThis video has **no audio track**, so there is nothing to transcribe. "
-            "The pipeline reads speech only — it never looks at the picture — so a silent "
-            "screen recording cannot produce real test cases.",
+            "\n\nThis video has **no audio track**, so there was nothing to transcribe. "
+            "Reading the picture instead (OCR) was tried and did not work either — the "
+            "reason above says why. A silent screen recording needs that path to succeed.",
         data_ingestion.FFMPEG_MISSING:
             "\n\n`ffmpeg` is missing; Whisper needs it to read the audio. "
             "Install it (`brew install ffmpeg`) and re-run.",
@@ -603,6 +616,61 @@ def warn_if_synthetic_transcript(video_content):
         + (f"\n\nReason: `{reason}`" if reason else "")
         + hint
     )
+
+
+def notice_if_ocr_transcript(video_content):
+    """Say when the transcript was read off the screen rather than heard.
+
+    The counterpart to `warn_if_synthetic_transcript`: that one fires when nothing
+    real was captured, this one when something real was captured *by a different
+    means than the user expects*. Silence here would leave OCR indistinguishable
+    from a normal transcription run, which is the failure class phase 5 removed.
+    """
+    info = video_content.get('ocr_info')
+    method = video_content.get('transcript_method') or ""
+    if not info:
+        return
+
+    if not info.get('segments'):
+        # OCR was asked for and could not run at all -- most often a YouTube URL
+        # whose download was skipped, so there is no local file to look at.
+        st.warning(
+            "🔎 **On-screen text could not be read**, so this run used the audio alone."
+            + (f"\n\nReason: `{info['error']}`" if info.get('error') else "")
+        )
+        return
+
+    ocr_only = method in data_ingestion.OCR_METHODS
+    captioned = info.get('vision_frames') or 0
+    logger.info("ocr transcript: method=%s keyframes=%s segments=%s captioned=%s",
+                method, info.get('keyframes'), info.get('segments'), captioned)
+
+    served = (info.get('vision_attribution') or {}).get('display')
+    detail = (
+        f"Read **{info.get('segments', 0)}** passages from "
+        f"**{info.get('keyframes', 0)}** keyframes."
+    )
+    if captioned:
+        detail += (f" **{captioned}** of them had too little readable text, so they were "
+                   f"described by a vision model ({served or info.get('vision_model')}).")
+
+    if ocr_only:
+        st.info(
+            "👁️ **This transcript was read off the screen, not heard.** Speech "
+            "transcription found nothing, so the pipeline sampled the video on visual "
+            "change and read the on-screen text instead. " + detail
+        )
+    else:
+        st.info("👁️ **On-screen text was read in as well as the audio.** " + detail)
+
+    if info.get('vision_error'):
+        st.warning(
+            "🖼️ **Vision captioning failed**, so frames without readable text "
+            "contributed nothing."
+            f"\n\nReason: `{info['vision_error']}`"
+            "\n\nSet `OMNIROUTE_VISION_MODEL` to a model that accepts images — the "
+            "`auto/*vision` routes are combos and may not be serviceable on your gateway."
+        )
 
 
 def wire_retriever(test_agent, data_agent, video_content):
@@ -635,7 +703,8 @@ def wire_retriever(test_agent, data_agent, video_content):
 
 
 def generate_test_cases_from_url(url, categories, priorities, model,
-                                 max_cases=MAX_TEST_CASES, distribution="even"):
+                                 max_cases=MAX_TEST_CASES, distribution="even",
+                                 force_ocr=False):
     """Generate test cases from YouTube URL"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -693,7 +762,7 @@ def generate_test_cases_from_url(url, categories, priorities, model,
                 "Test cases are still model-generated, but from fake source material."
             )
         else:
-            video_content = data_agent.process_video_content(url)
+            video_content = data_agent.process_video_content(url, force_ocr=force_ocr)
         
         if not video_content.get("success"):
             logger.error("video processing failed: %s", video_content.get('error'))
@@ -705,6 +774,7 @@ def generate_test_cases_from_url(url, categories, priorities, model,
         # mock path, or a gateway that cannot embed) rather than degrading quietly.
         wire_retriever(test_agent, data_agent, video_content)
         warn_if_synthetic_transcript(video_content)
+        notice_if_ocr_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")
@@ -930,7 +1000,8 @@ def format_test_cases_fallback(test_cases, agent=None):
     }
 
 def generate_test_cases_from_file(uploaded_file, categories, priorities, model,
-                                  max_cases=MAX_TEST_CASES, distribution="even"):
+                                  max_cases=MAX_TEST_CASES, distribution="even",
+                                  force_ocr=False):
     """Generate test cases from uploaded video file"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -954,11 +1025,12 @@ def generate_test_cases_from_file(uploaded_file, categories, priorities, model,
         logger.info("generating from upload: %s (%d bytes) categories=%s model=%s",
                     uploaded_file.name, temp_file_path.stat().st_size, categories,
                     model or "default")
-        video_content = data_agent.process_video_file(str(temp_file_path))
+        video_content = data_agent.process_video_file(str(temp_file_path), force_ocr=force_ocr)
         
         # See the URL path: retrieval-backed context, transcript head if unavailable.
         wire_retriever(test_agent, data_agent, video_content)
         warn_if_synthetic_transcript(video_content)
+        notice_if_ocr_transcript(video_content)
         
         # Step 2: Generate test cases
         status_text.text("🤖 Generating test cases...")

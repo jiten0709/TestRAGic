@@ -134,3 +134,51 @@ def test_an_empty_response_is_flagged_but_not_a_provider_failure(gateway):
     assert text == ""
     assert attribution.fallback is False
     assert "empty response" in attribution.note
+
+
+# --------------------------------------------------------------------------
+# images -- the OCR path's frame captioning. Not a second call path.
+# --------------------------------------------------------------------------
+
+def capture(gateway, model="vision-1", provider_name="oc", content="a login form"):
+    """Record the outgoing body so the message shape can be asserted."""
+    sent = {}
+    inner = gateway.chat_ok(provider_name, model, content=content)
+
+    def handler(request, body):
+        sent.update(body)
+        return inner(request, body)
+
+    gateway.chat_by_model[model] = handler
+    return sent
+
+
+def test_images_become_openai_content_parts(gateway):
+    sent = capture(gateway)
+    text, attribution = provider.chat("describe this", model="vision-1", images=[b"\xff\xd8jpeg"])
+
+    content = sent["messages"][-1]["content"]
+    assert content[0] == {"type": "text", "text": "describe this"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert text == "a login form"
+    assert attribution.model == "vision-1"
+
+
+def test_a_text_prompt_still_sends_a_bare_string(gateway):
+    sent = capture(gateway, model="gpt-4o-mini", provider_name="openai")
+    provider.chat("describe this", model="gpt-4o-mini")
+    assert sent["messages"][-1]["content"] == "describe this"
+
+
+def test_a_vision_request_does_not_fall_back_to_a_text_model(three_rung):
+    """The chain would descend to the text default and then to `auto`, sending an
+    image to models that may not accept one -- and on the gateway this was built
+    against every `auto/*` route answers 502. Failing on the named model is honest."""
+    three_rung.chat_by_model["vision-1"] = three_rung.status(500)
+
+    with pytest.raises(provider.ProviderError) as excinfo:
+        provider.chat("describe", model="vision-1", images=[b"jpeg"])
+
+    assert [model for model, _ in excinfo.value.attempts] == ["vision-1"]
+    assert three_rung.chat_models_called == ["vision-1"]

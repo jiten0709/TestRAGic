@@ -58,6 +58,21 @@ def set_embedding_model(model: str):
     _session_set('embedding_model', model)
     os.environ["EMBEDDING_MODEL"] = model
 
+def get_vision_model():
+    """Model for captioning video frames: session state, then $OMNIROUTE_VISION_MODEL.
+
+    None means the OCR path reads text only and never calls a vision model. There is
+    no default on purpose -- see `video_ocr.vision_model` for why guessing an
+    `auto/*vision` route is worse than leaving it off."""
+    return _session_get('vision_model') or os.getenv('OMNIROUTE_VISION_MODEL')
+
+def set_vision_model(model: str):
+    _session_set('vision_model', model)
+    if model:
+        os.environ["OMNIROUTE_VISION_MODEL"] = model
+    else:
+        os.environ.pop("OMNIROUTE_VISION_MODEL", None)
+
 def get_gateway_base_url():
     """OmniRoute gateway URL. Its presence is what selects OmniRoute mode."""
     return _session_get('omniroute_base_url') or os.getenv('OMNIROUTE_BASE_URL')
