@@ -1410,9 +1410,15 @@ def execute_playwright_tests(selected_files, browsers, headless, base_url, captu
                 else:
                     skipped += 1
 
+                # A case can pass while one of its assertions was never converted;
+                # the row has to say so or the green is worth less than it looks.
+                unchecked = origin.get("unchecked") or []
+                note = case["error"] or (
+                    f"not checked: {'; '.join(unchecked)}" if unchecked else "")
+
                 execution_log.append(
                     f"{symbol} {test_id} - {engine}: {case['status'].upper()} "
-                    f"({case['duration']:.1f}s)" + (f" - {case['error']}" if case['error'] else "")
+                    f"({case['duration']:.1f}s)" + (f" - {note}" if note else "")
                 )
                 detailed_results.append({
                     "Test Case": test_id,
@@ -1421,7 +1427,7 @@ def execute_playwright_tests(selected_files, browsers, headless, base_url, captu
                     "Browser": engine.title(),
                     "Priority": (origin.get("priority") or "medium").title(),
                     "Duration": f"{case['duration']:.1f}s",
-                    "Error": case["error"],
+                    "Error": note,
                 })
 
             progress_bar.progress(min(10 + int(position / len(engines) * 90), 100))

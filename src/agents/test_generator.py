@@ -249,7 +249,16 @@ JSON_SCHEMA_INSTRUCTION = """Return ONLY a JSON array. Each element must use exa
     "assertions": ["One verifiable statement per assertion"]
   }
 ]
-Use lowercase keys exactly as shown. "steps" and "assertions" are arrays of plain strings, not objects."""
+Use lowercase keys exactly as shown. "steps" and "assertions" are arrays of plain strings, not objects.
+
+Every step must be one thing a person does to the UI -- click, type, select, upload,
+navigate -- naming the element and quoting any literal value: Enter "admin" in the
+Password field. Steps are converted to Playwright automatically, so:
+- No narrative or precondition steps ("Start from the dashboard after login"): write
+  out the actions that get there, every time, from the first page.
+- No verification steps ("Verify the dashboard loads"): checks belong in "assertions".
+- Write URLs in full, with the scheme: https://example.com/admin/.
+- Quote only text you actually saw in the material above; do not invent error wording."""
 
 
 # Template Constants

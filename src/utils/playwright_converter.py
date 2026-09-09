@@ -8,7 +8,9 @@ The one rule that matters: **a step that cannot be converted must fail loudly.**
 This used to emit `# TODO: Define selector` as a bare comment, which pytest reads
 as a passing test that does nothing -- the worst possible outcome for a QA tool.
 Unconvertible steps now emit `pytest.skip(...)`, which shows up as a skip in the
-report and in the dashboard.
+report and in the dashboard. An unconvertible *check* is deferred to the end of the
+test instead: the flow and the case's real assertions still run, and the test still
+finishes on a skip, so nothing unchecked is ever reported as a pass.
 """
 
 import re
@@ -27,16 +29,18 @@ DEFAULT_TIMEOUT = 30000  # 30 seconds
 GENERATED_TESTS_DIR = Path("src/data/generated_tests")
 
 # action -> (recogniser, how to emit it). "page" actions take no locator.
+# Ordered: back/forward are tried before navigate, or "navigate back" would goto.
 PAGE_ACTIONS = {
-    'navigate': (r'navigate to|go to|visit|open|browse to', 'goto'),
-    'reload': (r'reload|refresh', 'reload'),
     'back': (r'go back|navigate back', 'go_back'),
     'forward': (r'go forward|navigate forward', 'go_forward'),
+    'reload': (r'reload|refresh', 'reload'),
+    'navigate': (r'navigate|go to|visit|open|browse to', 'goto'),
     'wait': (r'wait for|wait|pause', 'wait_for_timeout'),
 }
 
 # Locator actions, longest-phrase-first so "double click" beats "click".
 LOCATOR_ACTIONS = [
+    ('scroll', r'scroll to|scroll into view|scroll', 'scroll_into_view_if_needed'),
     ('double_click', r'double[- ]click', 'dblclick'),
     ('right_click', r'right[- ]click|context click', 'click'),
     ('uncheck', r'uncheck|untick', 'uncheck'),
@@ -74,8 +78,13 @@ _ARTICLES = {
     'click', 'clicks', 'press', 'tap', 'check', 'uncheck', 'select', 'choose', 'pick',
     'enter', 'type', 'input', 'fill', 'hover', 'focus', 'upload', 'attach', 'clear',
     'verify', 'ensure', 'confirm', 'see', 'is', 'are', 'should', 'be', 'displayed',
-    'visible', 'shown', 'user', 'page',
+    'visible', 'shown', 'user', 'page', 'scroll', 'locate', 'leave', 'that',
 }
+
+# Marker on a skip that stands for a *check* rather than an action. An unchecked
+# assertion must not abort the flow (see _convert_single_test); an unconvertible
+# action must, because everything after it runs on a screen that never happened.
+UNCONVERTED_CHECK = "unconverted assertion: "
 
 # Keys a bare "press X" step can mean. Anything else is treated as an element name.
 KEY_NAMES = {'enter', 'tab', 'escape', 'esc', 'space', 'backspace', 'delete', 'end',
@@ -174,11 +183,13 @@ class PlaywrightConverter:
             while name in seen:                      # two cases may share a title
                 name = f"{name}_{i}"
             seen.add(name)
+            code, unchecked = self._convert_single_test(test, name, base_url)
             self.case_index[f"test_{name}"] = {
                 "id": test.get("id", ""), "title": test.get("title", ""),
                 "priority": test.get("priority", ""), "category": category,
+                "unchecked": unchecked,
             }
-            methods.append(self._convert_single_test(test, name, base_url))
+            methods.append(code)
 
         # Module-level functions, not a Test* class: this repo's pytest.ini sets
         # `python_classes =` (empty) so that TestGeneratorAgent / TestExecutorAgent
@@ -200,7 +211,7 @@ class PlaywrightConverter:
         ]
         if not steps:
             body.append(f"    pytest.skip({'test case has no steps: ' + title!r})")
-            return "\n".join(body) + "\n"
+            return "\n".join(body) + "\n", []
 
         lines = [(step, self.convert_step(str(step), base_url)) for step in steps]
 
@@ -210,13 +221,26 @@ class PlaywrightConverter:
         if not any(code.startswith("page.goto(") for _, code in lines):
             body.append("    page.goto(BASE_URL)")
 
-        for number, (step, code) in enumerate(lines, 1):
-            body.append(f"    # Step {number}: {self._comment(step)}")
+        items = [(f"Step {n}", step, code) for n, (step, code) in enumerate(lines, 1)]
+        items += [("Verify", source, code) for source, code in self._assertions_for(test)]
+
+        # A check that could not be converted does not skip where it stands: that
+        # threw away the flow and every real assertion after it over one sentence
+        # nothing could parse. It is recorded, and the test still skips when it
+        # leaves *nothing* verified -- a flow that checks nothing is a green lie.
+        unchecked, checked = [], False
+        for label, source, code in items:
+            if UNCONVERTED_CHECK in code and code.startswith("pytest.skip("):
+                unchecked.append(str(source))
+                body.append(f"    # {label} (NOT CHECKED): {self._comment(source)}")
+                continue
+            checked = checked or code.startswith("expect(")
+            body.append(f"    # {label}: {self._comment(source)}")
             body.append(f"    {code}")
 
-        for assertion in self._assertions_for(test):
-            body.append(f"    {assertion}")
-        return "\n".join(body) + "\n"
+        if unchecked and not checked:
+            body.append(f"    pytest.skip({UNCONVERTED_CHECK + '; '.join(unchecked)!r})")
+        return "\n".join(body) + "\n", unchecked
 
     def convert_step(self, step: str, base_url: str = "") -> str:
         """One English step -> one line of Playwright, or a visible skip."""
@@ -224,7 +248,7 @@ class PlaywrightConverter:
 
         # A step phrased as a check is an assertion, not an action -- models write
         # plenty of them, and converting one to a click would be nonsense.
-        if re.match(r'(verify|ensure|confirm|assert|validate|observe)\b', lowered):
+        if re.match(r'(verify|ensure|confirm|assert|validate|observe|locate|check that|make sure|see that)\b', lowered):
             return self._generate_assertion(step)
 
         for action, (pattern, method) in PAGE_ACTIONS.items():
@@ -313,9 +337,15 @@ class PlaywrightConverter:
         before = re.search(rf'((?:[\w\'-]+\s+){{0,3}})\b{re.escape(role_word)}s?\b',
                            step, re.IGNORECASE)
         if before:
-            words = [w for w in before.group(1).split() if w.lower() not in _ARTICLES]
-            if words:
-                return " ".join(words).strip("\"'.,:")
+            words = before.group(1).split()
+            # A step reads "<verb> the <Name> <role>": keep only what follows the
+            # last article, so a verb this list has never heard of ("Leave the
+            # Password field empty") cannot leak into the element's name.
+            cut = max((i for i, w in enumerate(words) if w.lower() in _ARTICLES), default=-1)
+            kept = [w for w in words[cut + 1:] if w.lower() not in _ARTICLES]
+            kept = kept or [w for w in words if w.lower() not in _ARTICLES]
+            if kept:
+                return " ".join(kept).strip("\"'.,:")
         return ""
 
     @staticmethod
@@ -352,22 +382,20 @@ class PlaywrightConverter:
         match = re.search(r'https?://[^\s"\'<>]+', step)
         if match:
             return match.group(0).rstrip('.,')
+        host = re.search(r'\b((?:[\w-]+\.)+[a-z]{2,}\b(?:/[\w\-./]*)?)', step, re.IGNORECASE)
+        if host:
+            return "https://" + host.group(1).rstrip('.,')
         path = re.search(r'\s(/[\w\-/]*)', step)
         if path and base_url:
             return base_url.rstrip('/') + path.group(1)
         return base_url or "about:blank"
 
-    def _assertions_for(self, test: Dict) -> List[str]:
-        """Assertions from the case's own `assertions`, else its expected_result."""
+    def _assertions_for(self, test: Dict) -> List[tuple]:
+        """(source, code) from the case's own `assertions`, else its expected_result."""
         sources = [a for a in (test.get("assertions") or []) if str(a).strip()]
         if not sources and test.get("expected_result"):
             sources = [test["expected_result"]]
-
-        lines = []
-        for source in sources:
-            lines.append(f"# Verify: {self._comment(source)}")
-            lines.append(self._generate_assertion(str(source)))
-        return lines
+        return [(source, self._generate_assertion(str(source))) for source in sources]
 
     def _generate_assertion(self, expected: str) -> str:
         """An `expect(...)` call, or a skip that names what could not be checked."""
@@ -377,6 +405,11 @@ class PlaywrightConverter:
         url = re.search(r'https?://[^\s"\']+', expected)
         if url:
             return f"expect(page).to_have_url({url.group(0).rstrip('.,')!r})"
+
+        if quoted and re.search(r'\burls?\b|\bredirect', lowered):
+            # get_by_text of a URL matches nothing; to_have_url retries while the
+            # navigation the previous step kicked off is still in flight.
+            return f"expect(page).to_have_url(re.compile({re.escape(quoted.group(1).strip())!r}))"
 
         if quoted:
             text = quoted.group(1).strip()
@@ -394,7 +427,7 @@ class PlaywrightConverter:
                 return f"expect({locator}).to_be_disabled()"
             return f"expect({locator}).to_be_visible()"
 
-        return f"pytest.skip({'unconverted assertion: ' + expected!r})"
+        return f"pytest.skip({UNCONVERTED_CHECK + expected!r})"
 
     # ------------------------------------------------------------------
     # helpers
@@ -403,6 +436,8 @@ class PlaywrightConverter:
     def _module_header(base_url: str) -> str:
         return (
             '"""Generated Playwright suite -- regenerate rather than edit."""\n'
+            "\n"
+            "import re\n"
             "\n"
             "import pytest\n"
             "from playwright.sync_api import Page, expect\n"

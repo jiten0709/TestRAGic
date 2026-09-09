@@ -148,6 +148,46 @@ def test_generated_modules_are_valid_python(converter):
     assert list(result["case_index"].values())[0]["id"] == "TC001"
 
 
+def test_an_unconvertible_check_does_not_abort_the_checks_that_did_convert(converter):
+    """The killer: one unparseable sentence used to skip the whole flow at step 5."""
+    case = {"id": "TC001", "title": "Login", "category": "ui",
+            "steps": ['Navigate to https://example.com/login',
+                      'Enter "admin" in the Password field',
+                      'Verify redirection to the dashboard'],   # nothing to convert
+            "assertions": ['The "Dashboard" heading is visible']}
+    code = converter.convert_test_cases([case])["converted_tests"]["ui"]
+
+    assert "pytest.skip" not in code, "a converted assertion ran: the case has a verdict"
+    assert code.index("get_by_label('Password')") < code.index("expect(")
+    assert "NOT CHECKED" in code, "the gap still has to be visible in the file"
+
+
+def test_a_case_where_nothing_could_be_checked_still_skips(converter):
+    """A flow that verifies nothing must never report green."""
+    case = {"id": "TC002", "title": "Blind", "category": "ui",
+            "steps": ['Navigate to https://example.com/'],
+            "assertions": ["Everything looks fine"]}
+    code = converter.convert_test_cases([case])["converted_tests"]["ui"]
+    assert "pytest.skip" in code
+
+
+def test_an_unlisted_verb_does_not_leak_into_the_element_name(converter):
+    """`get_by_label('Leave Password')` matched nothing and burned the 30s timeout."""
+    assert converter.convert_step("Leave the Password field empty.") == \
+        "page.get_by_label('Password').clear()"
+
+
+def test_a_host_without_a_scheme_is_still_a_host(converter):
+    assert converter.convert_step("Navigate directly to admin-demo.nopcommerce.com/admin/") == \
+        "page.goto('https://admin-demo.nopcommerce.com/admin/')"
+
+
+def test_an_assertion_about_the_url_checks_the_url(converter):
+    """get_by_text of a URL matches nothing; to_have_url also waits for the nav."""
+    line = converter._generate_assertion("The URL contains '/admin/'.")
+    assert line.startswith("expect(page).to_have_url(")
+
+
 def test_a_case_with_no_steps_skips_rather_than_passing_empty(converter):
     code = converter.convert_test_cases([{"title": "Empty", "category": "ui", "steps": []}])
     assert "pytest.skip" in code["converted_tests"]["ui"]
