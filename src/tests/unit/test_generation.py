@@ -2,10 +2,21 @@
 
 import pytest
 
-from src.agents.test_generator import TestGeneratorAgent, _scan_json
+from src.agents.test_generator import (
+    FULL_CONTEXT_CHARS,
+    TestGeneratorAgent,
+    _scan_json,
+)
 
 
 VIDEO = {"transcript": "click sign up, enter email", "video_info": {"title": "Demo"}}
+
+# Retrieval only runs above FULL_CONTEXT_CHARS -- a transcript that fits goes into the
+# prompt whole, because no subset of it beats it. VIDEO's transcript is 26 characters,
+# so any test that means to exercise the *retrieval* path has to be bigger than that.
+LONG_VIDEO = {"transcript": "click sign up, enter email. " * 600,
+              "video_info": {"title": "Demo"}}
+assert len(LONG_VIDEO["transcript"]) > FULL_CONTEXT_CHARS
 
 NESTED = '''Sure, here are the test cases:
 
@@ -162,7 +173,7 @@ def test_each_category_queries_the_retriever_and_its_chunks_reach_the_prompt(gat
 
     agent = TestGeneratorAgent(model="auto")
     agent.set_retriever(retriever)
-    agent.generate_comprehensive_tests(VIDEO, ["ui", "accessibility"], ["high"])
+    agent.generate_comprehensive_tests(LONG_VIDEO, ["ui", "accessibility"], ["high"])
 
     assert len(retriever.queries) == 2, "one query per category"
     assert [q.split(":")[0] for q in retriever.queries] == ["ui", "accessibility"]
@@ -180,7 +191,7 @@ def test_without_a_retriever_the_transcript_head_is_still_used(gateway):
 
     agent = TestGeneratorAgent(model="auto")
     assert agent.retriever is None
-    agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
+    agent.generate_comprehensive_tests(LONG_VIDEO, ["ui"], ["high"])
 
     assert "click sign up" in prompts[0]
 
@@ -200,7 +211,40 @@ def test_generation_degrades_to_the_transcript_head_never_crashes(gateway, retri
 
     agent = TestGeneratorAgent(model="auto")
     agent.set_retriever(retriever)
-    cases = agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
+    cases = agent.generate_comprehensive_tests(LONG_VIDEO, ["ui"], ["high"])
 
     assert "click sign up" in prompts[0]
     assert cases, "a failed retrieval must not sink generation"
+
+
+def test_a_transcript_that_fits_is_passed_whole_and_skips_retrieval(gateway):
+    """k=5 handed the model ~1,266 chars of a 5,534-char transcript -- less than the
+    2,000-char head it was meant to improve on. Below the threshold the source wins."""
+    prompts = _capture_prompts(gateway)
+    retriever = FakeRetriever(chunks=("a retrieved chunk",))
+
+    agent = TestGeneratorAgent(model="auto")
+    agent.set_retriever(retriever)
+    agent.generate_comprehensive_tests(VIDEO, ["ui"], ["high"])
+
+    assert retriever.queries == [], "a transcript that fits needs no retrieval"
+    assert VIDEO["transcript"] in prompts[0], "the whole transcript, not a slice of it"
+    assert "..." not in prompts[0].split("Video Transcript:")[1][:60], "not the truncated head"
+
+
+def test_every_category_the_ui_offers_gets_its_own_template():
+    """The lookup was `category.lower().replace(' ', '_')` against keys
+    `functional|ui|integration|edge_case`, so every label app.py offers missed and fell
+    through to the functional template -- and _retrieval_query, which derives its query
+    from the template, then asked the same question for every category."""
+    from src.agents.test_generator import template_for
+
+    offered = ["Core User Flows", "Edge Cases", "Cross-browser",
+               "Mobile", "Accessibility", "Performance"]
+    templates = [template_for(c) for c in offered]
+
+    assert len(set(templates)) == len(offered), "each category needs its own template"
+    for category, template in zip(offered, templates):
+        query = TestGeneratorAgent._retrieval_query(category, template)
+        assert len(query) > 40, f"{category}: a bare label is too weak a query"
+    assert template_for("edge_case") == template_for("Edge Cases"), "spelling-insensitive"

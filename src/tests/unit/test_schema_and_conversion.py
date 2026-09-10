@@ -6,13 +6,14 @@ gateway. The end-to-end run against a real browser lives in
 """
 
 import ast
+import re
 import textwrap
 
 import pytest
 
 from src.agents.test_executor import TestExecutorAgent
 from src.agents.test_generator import normalise_case, normalise_cases
-from src.utils.playwright_converter import PlaywrightConverter
+from src.utils.playwright_converter import UNCONVERTED_CHECK, PlaywrightConverter
 
 
 # --------------------------------------------------------------------------
@@ -171,6 +172,61 @@ def test_a_case_where_nothing_could_be_checked_still_skips(converter):
     assert "pytest.skip" in code
 
 
+@pytest.mark.parametrize("step", [
+    "Enter a valid password in the Password field.",
+    "Enter an invalid email address in the Email field.",
+    "Type some text into the Search box",
+])
+def test_a_described_value_is_not_typed_into_the_field(converter, step):
+    """`.fill('a valid password')` types the prose in, character for character: the
+    step looks converted so nothing reports a gap, and the assertion after it fails for
+    a reason that has nothing to do with the application."""
+    line = converter.convert_step(step)
+    assert line.startswith("pytest.skip("), line
+    assert "no value found" in line
+
+
+@pytest.mark.parametrize("step, expected", [
+    ('Enter "admin123" in the Password field', "page.get_by_label('Password').fill('admin123')"),
+    ('Enter "a@b.com" into the Email field', "page.get_by_label('Email').fill('a@b.com')"),
+])
+def test_a_quoted_literal_is_still_a_value(converter, step, expected):
+    """The placeholder guard must not eat real data -- 'a@b.com' opens with 'a'."""
+    assert converter.convert_step(step) == expected
+
+
+def test_a_stop_word_inside_a_name_is_kept(converter):
+    """"Click the LOG IN button" named the button 'LOG': 'in' is an article, so the
+    name was cut at it. Observed live on the nopCommerce login form."""
+    assert converter.convert_step("Click the LOG IN button.") == \
+        "page.get_by_role('button', name='LOG IN').click()"
+
+
+@pytest.mark.parametrize("assertion", [
+    "An error message is visible next to the password field.",
+    "At least one order row is displayed in the Latest Orders table.",
+])
+def test_an_assertion_that_quotes_nothing_is_recorded_not_guessed(converter, assertion):
+    """The worst outcome for a QA tool. The first of these compiled to
+    `expect(page.get_by_label('password')).to_be_visible()` -- the password *input*,
+    which is visible on the login page whether or not validation ever fired, so a
+    negative test could not fail. A recorded gap beats a check that always passes."""
+    line = converter._generate_assertion(assertion)
+    assert line.startswith("pytest.skip("), line
+    assert UNCONVERTED_CHECK in line
+
+
+@pytest.mark.parametrize("assertion, expected", [
+    ('The text "Login was unsuccessful" is visible',
+     "expect(page.get_by_text('Login was unsuccessful')).to_be_visible()"),
+    ("The Submit button is disabled",
+     "expect(page.get_by_role('button', name='Submit')).to_be_disabled()"),
+])
+def test_a_grounded_assertion_still_converts(converter, assertion, expected):
+    """A quoted literal, or a state word the sentence actually used, is a real check."""
+    assert converter._generate_assertion(assertion) == expected
+
+
 def test_an_unlisted_verb_does_not_leak_into_the_element_name(converter):
     """`get_by_label('Leave Password')` matched nothing and burned the 30s timeout."""
     assert converter.convert_step("Leave the Password field empty.") == \
@@ -180,6 +236,45 @@ def test_an_unlisted_verb_does_not_leak_into_the_element_name(converter):
 def test_a_host_without_a_scheme_is_still_a_host(converter):
     assert converter.convert_step("Navigate directly to admin-demo.nopcommerce.com/admin/") == \
         "page.goto('https://admin-demo.nopcommerce.com/admin/')"
+
+
+@pytest.mark.parametrize("url, matches", [
+    ("https://admin-demo.nopcommerce.com/login", True),
+    ("https://admin-demo.nopcommerce.com/login?returnUrl=%2Fadmin%2F", True),
+    ("https://admin-demo.nopcommerce.com/login/", True),
+    ("https://admin-demo.nopcommerce.com/admin/", False),
+    ("https://admin-demo.nopcommerce.com/login/extra", False),
+    ("https://evil.example.com/login", False),
+])
+def test_a_full_url_assertion_survives_a_query_string(converter, url, matches):
+    """Observed live: the app redirected to `/login?returnUrl=%2Fadmin%2F` -- exactly the
+    behaviour the test was checking -- and the exact whole-string match reported it as a
+    failure. A different path must still fail."""
+    line = converter._generate_assertion(
+        "The URL is 'https://admin-demo.nopcommerce.com/login'")
+    pattern = re.compile(eval(line[len("expect(page).to_have_url("):-1]).pattern)
+    assert bool(pattern.search(url)) is matches
+
+
+def test_a_url_assertion_that_names_a_query_is_held_to_it(converter):
+    """Only the query the app adds itself is tolerated; one the assertion pinned is not."""
+    line = converter._generate_assertion("The URL is 'https://x.test/login?returnUrl=%2Fa'")
+    assert line == "expect(page).to_have_url('https://x.test/login?returnUrl=%2Fa')"
+
+
+@pytest.mark.parametrize("step, expected", [
+    ("Clear the Password field", "page.get_by_label('Password').clear()"),
+    ("Uncheck the Remember me checkbox",
+     "page.get_by_role('checkbox', name='Remember me').uncheck()"),
+])
+def test_the_state_setting_step_the_prompt_asks_for_is_convertible(converter, step, expected):
+    """JSON_SCHEMA_INSTRUCTION tells the model to write an explicit step for a control's
+    starting state ("Clear the Password field") rather than assuming a form arrives
+    empty. Observed live: a case titled "Login attempt with empty password field" never
+    cleared the field, the pre-filled default was submitted, and the test exercised a
+    *successful* login while asserting a failed one. The rule is only worth asking for
+    if the converter can compile the step it asks for."""
+    assert converter.convert_step(step) == expected
 
 
 def test_an_assertion_about_the_url_checks_the_url(converter):

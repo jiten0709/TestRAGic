@@ -71,6 +71,14 @@ def _merge_segments(spoken: List[Dict], seen: List[Dict]) -> List[Dict]:
 
 DEFAULT_STORE_KEY = "default"
 
+# An action keyword only ends a chunk once the chunk holds at least this much text.
+# Without a floor, every segment naming an action started a new chunk, and a Whisper
+# segment is ~5-10 words -- so the chunker cut precisely the sentences describing UI
+# actions, mid-clause. Measured on demo-2: chunk[2] ended "...For that, click on" and
+# chunk[3] began "accounts from the homepage", putting the verb and its object in
+# different chunks. Median chunk was 187 chars.
+MIN_CHUNK_CHARS = 400
+
 
 def store_key_for(source: str) -> str:
     """Directory name for one source's vectors: the YouTube id, or the file's stem.
@@ -663,7 +671,9 @@ class DataIngestionAgent:
             # Determine if this should start a new chunk
             should_split = (
                 len(current_chunk["text"]) > 800 or  # Size-based split
-                (actions_found and current_chunk["text"]) or  # Action-based split
+                # Action-based split, but only once the chunk carries enough context
+                # to stand on its own -- see MIN_CHUNK_CHARS.
+                (actions_found and len(current_chunk["text"]) >= MIN_CHUNK_CHARS) or
                 self._is_topic_change(current_chunk["text"], text)  # Topic change
             )
             

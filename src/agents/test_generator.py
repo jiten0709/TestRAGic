@@ -83,6 +83,14 @@ PRIORITIES = ("critical", "high", "medium", "low")
 MAX_TEST_CASES = 20
 PRIORITY_WEIGHTS = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
+# A transcript at or under this many characters goes into every prompt whole, and
+# retrieval is skipped. Retrieval only helps on a corpus that does not fit, and
+# measured on the two videos in src/data/transcripts/ neither does: k=5 hands the
+# model ~1,266 chars of a 5,534-char transcript -- less than the 2,000-char head it
+# is supposed to improve on, and under a quarter of a source that is ~1.4k tokens
+# whole. 12000 chars is roughly 3k tokens. Above it, RAG works as before.
+FULL_CONTEXT_CHARS = 12000
+
 
 def allocate(total, buckets, weights=None):
     """Split `total` across `buckets`; the parts sum to exactly `total`.
@@ -258,113 +266,172 @@ Password field. Steps are converted to Playwright automatically, so:
   out the actions that get there, every time, from the first page.
 - No verification steps ("Verify the dashboard loads"): checks belong in "assertions".
 - Write URLs in full, with the scheme: https://example.com/admin/.
-- Quote only text you actually saw in the material above; do not invent error wording."""
+- Quote only text you actually saw in the material above; do not invent error wording.
+- Never write a placeholder value. "Enter a valid password" is typed into the field
+  literally, character for character; write Enter "admin123" instead.
+- Every assertion must quote the exact on-screen text, URL fragment or element name
+  you expect to see. An assertion that quotes nothing cannot be checked and is
+  discarded, leaving the case with no verdict.
+- Every case starts from the first page and performs its own navigation and login.
+  Nothing is carried over from another test case.
+- A control's starting state is a step, not an assumption. A form can arrive pre-filled,
+  pre-checked or pre-selected, so if the case needs a field empty, write "Clear the
+  <name> field" as its own step before submitting. A case whose title promises a state
+  its steps never create tests the opposite of what it claims.
+
+BAD -- vague; compiles to a test that cannot fail:
+  step:      "Enter a valid password in the Password field"
+  step:      "Start from the admin dashboard after successful login"
+  assertion: "An error message is visible next to the password field"
+GOOD -- every value and every expected string is a literal you saw:
+  step:      "Enter \\"admin123\\" in the Password field"
+  step:      "Navigate to https://example.com/login"
+  assertion: "The text \\"Login was unsuccessful\\" is visible"
+
+BAD -- the title promises a state the steps never create, so the form's own default
+value is submitted and the test exercises a *successful* login:
+  title: "Login attempt with empty password field"
+  steps: ["Enter \\"admin@example.com\\" in the Email field",
+          "Click the \\"LOG IN\\" button"]
+GOOD -- the state is established before it is relied on:
+  title: "Login attempt with empty password field"
+  steps: ["Enter \\"admin@example.com\\" in the Email field",
+          "Clear the Password field",
+          "Click the \\"LOG IN\\" button"]
+"""
 
 
-# Template Constants
-FUNCTIONAL_TEMPLATE = """You are an expert QA engineer specializing in frontend test automation. 
-Generate comprehensive functional test cases for the given user flow.
+# --------------------------------------------------------------------------
+# Category templates
+# --------------------------------------------------------------------------
+# One template per category the UI actually offers. Each is a persona line plus a
+# numbered focus list, and **the numbering is load-bearing**: _retrieval_query
+# parses `^\s*\d+\. (.+)$` out of the template to build the vector-store query,
+# so these lines are both the model's instructions and the retrieval query text.
+#
+# They carry no JSON block on purpose. JSON_SCHEMA_INSTRUCTION is appended to every
+# prompt separately; the schema these constants used to declare (`"priority":
+# "High|Medium|Low"`, `test_data`, `preconditions`) contradicted it.
 
-Return ONLY a valid JSON array of test cases with this exact structure:
-[
-  {
-    "title": "Clear, descriptive test title",
-    "description": "Detailed test description",
-    "steps": ["Step 1", "Step 2", "Step 3"],
-    "expected_result": "Expected outcome",
-    "priority": "High|Medium|Low",
-    "test_data": "Required test data",
-    "preconditions": "Setup requirements"
-  }
-]
-
-Focus on:
-- Happy path scenarios
-- Critical user journeys
-- Form validations
-- Navigation flows
-- Data submission and retrieval
-- User interactions (clicks, inputs, selections)
-
-Make tests specific, actionable, and directly related to the user flow."""
-
-EDGE_CASE_TEMPLATE = """You are an expert QA engineer specializing in edge case testing.
-Generate edge cases and boundary condition tests for the given user flow.
-
-Return ONLY a valid JSON array of edge cases with this exact structure:
-[
-  {
-    "title": "Edge case title",
-    "description": "What edge condition this tests",
-    "steps": ["Step 1", "Step 2"],
-    "expected_result": "Expected behavior",
-    "priority": "High|Medium|Low",
-    "edge_condition": "Specific boundary/edge condition",
-    "risk_level": "High|Medium|Low"
-  }
-]
-
-Focus on:
-- Boundary value testing (min/max inputs)
-- Invalid data scenarios
-- Network failures and timeouts
-- Browser compatibility issues
-- Concurrent user actions
-- Data corruption scenarios
-- System resource limitations
-- Security edge cases"""
-
-ACCESSIBILITY_TEMPLATE = """You are an accessibility testing expert following WCAG 2.1 guidelines.
-Generate accessibility test cases for the given user flow.
-
-Return ONLY a valid JSON array of accessibility tests with this exact structure:
-[
-  {
-    "title": "Accessibility test title",
-    "description": "Accessibility requirement being tested",
-    "steps": ["Step 1", "Step 2"],
-    "expected_result": "Accessible behavior expected",
-    "priority": "High|Medium|Low",
-    "wcag_guideline": "Relevant WCAG guideline",
-    "assistive_technology": "Screen reader|Keyboard navigation|Voice control"
-  }
-]
+FUNCTIONAL_TEMPLATE = """You are a senior QA engineer specialising in end-to-end frontend automation.
+Generate functional test cases for the user flow shown in the material above.
 
 Focus on:
-- Keyboard navigation
-- Screen reader compatibility
-- Color contrast and visual accessibility
-- Focus management
-- Alternative text for images
-- Form label associations
-- Semantic HTML structure
-- ARIA attributes"""
+1. The primary user journey demonstrated, from the first screen to the last
+2. Form entry, submission, and the confirmation that follows
+3. Navigation between the screens that actually appear in the material
+4. Data shown back to the user after an action succeeds
+5. What the screen shows when a required field is missing or wrong"""
 
-PERFORMANCE_TEMPLATE = """You are a performance testing expert.
-Generate performance test scenarios for the given user flow.
-
-Return ONLY a valid JSON array of performance tests with this exact structure:
-[
-  {
-    "title": "Performance test title",
-    "description": "Performance aspect being tested",
-    "steps": ["Step 1", "Step 2"],
-    "expected_result": "Performance criteria",
-    "priority": "High|Medium|Low",
-    "metric": "Load time|Response time|Memory usage",
-    "threshold": "Performance threshold (e.g., < 2 seconds)"
-  }
-]
+EDGE_CASE_TEMPLATE = """You are a senior QA engineer who specialises in breaking software.
+Generate edge case and negative-path test cases for the user flow shown above.
 
 Focus on:
-- Page load times
-- API response times
-- Memory consumption
-- CPU usage
-- Network efficiency
-- Large dataset handling
-- Concurrent user load
-- Mobile performance"""
+1. Invalid, empty and malformed input in the fields that appear on screen
+2. Boundary values: maximum length, zero, negative numbers, special characters
+3. Wrong credentials, expired sessions, and direct access to a protected screen
+4. Interrupting a flow midway: browser back, reload, double submit
+5. The exact message the user is shown when an action is refused
+
+Every case must name the specific field or control it abuses.
+Do not restate the happy path -- that is another category's job."""
+
+ACCESSIBILITY_TEMPLATE = """You are an accessibility specialist testing against WCAG 2.1 level AA.
+Generate accessibility test cases for the screens shown above.
+
+Focus on:
+1. Reaching and operating every control with the keyboard alone, in tab order
+2. Visible focus indication as focus moves between controls
+3. Form fields having a programmatically associated label
+4. Heading levels, landmarks, and the reading order of the page
+5. Text alternatives for images, icons, and controls that show no text
+
+Name the specific control or region on screen, never "the page".
+Add a "wcag_guideline" key naming the success criterion (for example "1.4.3")."""
+
+PERFORMANCE_TEMPLATE = """You are a performance engineer.
+Generate performance test cases for the flows shown above.
+
+Focus on:
+1. Time for the first screen of the flow to become interactive
+2. Time between submitting a form and the next screen appearing
+3. Rendering a list or table that holds many rows
+4. Repeating the flow back to back without a full reload
+5. Behaviour on a slow or throttled network connection
+
+Add a "metric" key and a "threshold" key carrying a number and a unit."""
+
+CROSS_BROWSER_TEMPLATE = """You are a QA engineer who tests the same flow across rendering engines.
+Generate cross-browser test cases for the flows shown above.
+
+Focus on:
+1. The same journey completing identically on Chromium, Firefox and WebKit
+2. Form controls that engines render differently: date, file, and select inputs
+3. Layout of the screens as the viewport is resized
+4. Fonts, icons and images loading on every engine
+5. Copy, paste and keyboard shortcuts inside text fields"""
+
+MOBILE_TEMPLATE = """You are a QA engineer testing on mobile viewports.
+Generate mobile test cases for the flows shown above.
+
+Focus on:
+1. The flow completing on a narrow viewport without horizontal scrolling
+2. Tap targets being large enough to hit and not overlapping
+3. Menus and navigation that collapse behind a toggle
+4. The on-screen keyboard covering the field being typed into
+5. Portrait and landscape orientation
+
+Name the specific control or screen from the material above."""
+
+UI_TEMPLATE = """You are a QA engineer specialising in user interface verification.
+Generate UI test cases for the screens shown above.
+
+Focus on:
+1. Every control that appears on screen being present and in the right state
+2. Labels, headings and button text reading exactly as shown in the material
+3. Enabled, disabled and error states of the form controls
+4. What appears and disappears as the user moves through the flow
+5. Lists, tables and panels rendering the data they are given"""
+
+INTEGRATION_TEMPLATE = """You are a QA engineer specialising in integration testing.
+Generate integration test cases for the flows shown above.
+
+Focus on:
+1. Data entered on one screen appearing correctly on a later screen
+2. A saved record surviving a reload or a fresh navigation
+3. Search, filter and list views reflecting a change made elsewhere
+4. Actions that depend on a prior action having completed
+5. The state the user is left in after leaving and re-entering the flow"""
+
+
+# Keyed by _flat(), the same case- and separator-insensitive identity the schema
+# aliases use, so "Edge Cases", "edge_case" and "edge cases" are one entry.
+#
+# This map replaced a dict keyed `functional|ui|integration|edge_case` that was
+# looked up with `category.lower().replace(' ', '_')`. Every label the UI offers
+# ("Core User Flows", "Edge Cases", "Accessibility", ...) missed it and silently
+# fell through to the functional template -- so every category was prompted as
+# functional, AND, because _retrieval_query derives its query from the template,
+# every category retrieved on the same functional topics. One lookup bug disabled
+# per-category prompting and per-category retrieval at once.
+CATEGORY_TEMPLATES = {
+    "coreuserflows": FUNCTIONAL_TEMPLATE,
+    "functional": FUNCTIONAL_TEMPLATE,
+    "edgecases": EDGE_CASE_TEMPLATE,
+    "edgecase": EDGE_CASE_TEMPLATE,        # singular: what the old dict was keyed on
+    "accessibility": ACCESSIBILITY_TEMPLATE,
+    "performance": PERFORMANCE_TEMPLATE,
+    "crossbrowser": CROSS_BROWSER_TEMPLATE,
+    "mobile": MOBILE_TEMPLATE,
+    "ui": UI_TEMPLATE,
+    "integration": INTEGRATION_TEMPLATE,
+}
+
+
+def template_for(category):
+    """The prompt template for a category label, however it is spelled."""
+    return CATEGORY_TEMPLATES.get(_flat(category), FUNCTIONAL_TEMPLATE)
+
 
 class TestGeneratorAgent:
     def __init__(self, model=None):
@@ -377,77 +444,9 @@ class TestGeneratorAgent:
         # which owns the endpoint, the fallback chain and the attribution headers.
         self.retriever = None
         self._attributions = []  # (category, Attribution), one per generated category
-        
-        # Test case templates
-        self.templates = {
-            "functional": self._get_functional_template(),
-            "ui": self._get_ui_template(),
-            "integration": self._get_integration_template(),
-            "edge_case": self._get_edge_case_template()
-        }
-        
+
         logger.info(f"TestGeneratorAgent initialized with model: {self.model}")
 
-    def _get_functional_template(self):
-        """Get functional test case template"""
-        return """
-        Generate functional test cases for the given application based on the video content.
-
-        Focus on:
-        1. Core user workflows shown in the video
-        2. UI interactions and validations
-        3. Data input/output scenarios
-        4. Navigation flows
-        5. Error handling scenarios
-        
-        Generate practical, executable test cases that can be automated with Playwright.
-        """
-
-    def _get_ui_template(self):
-        """Get UI test case template"""
-        return """
-        Generate UI-focused test cases based on the video content.
-        
-        Focus on:
-        1. Element visibility and positioning
-        2. Interactive elements (buttons, forms, links)
-        3. Responsive design aspects
-        4. Visual validation
-        5. Cross-browser compatibility
-        
-        Generate test cases that verify the user interface works correctly.
-        """
-
-    def _get_integration_template(self):
-        """Get integration test case template"""
-        return """
-        Generate integration test cases based on the video content.
-        
-        Focus on:
-        1. API interactions shown in the video
-        2. Data flow between components
-        3. Third-party service integrations
-        4. Database operations
-        5. System interactions
-        
-        Generate test cases that verify different system components work together.
-        """
-
-    def _get_edge_case_template(self):
-        """Get edge case test template"""
-        return """
-        Generate edge case and negative test scenarios.
-        
-        Focus on:
-        1. Invalid input handling
-        2. Boundary conditions
-        3. Error scenarios
-        4. Network failures
-        5. Security edge cases
-        
-        Generate test cases that verify system robustness.
-        """
-    
     def set_retriever(self, retriever):
         """Set the retriever from data ingestion agent"""
         self.retriever = retriever
@@ -472,12 +471,18 @@ class TestGeneratorAgent:
     def _context_for(self, category, transcript, template=None):
         """Source material for one category's prompt.
 
-        Without a retriever every category gets `transcript[:2000]` -- the same
-        first ~2000 *characters* of the video, so accessibility tests are written
-        from whatever was said in the opening ninety seconds. Retrieval queries the
-        vector store instead, which is also what makes the chosen embedding model
-        affect the output at all.
+        Three tiers. A transcript that fits (FULL_CONTEXT_CHARS) is passed whole --
+        no subset of a 5k-char source beats the source. Above that, retrieval queries
+        the vector store per category, which is what makes the chosen embedding model
+        affect the output at all. If that fails or returns nothing, the last resort is
+        `transcript[:2000]` -- the same opening ~2000 *characters* for every category,
+        so accessibility tests get written from the opening ninety seconds.
         """
+        if transcript and len(transcript) <= FULL_CONTEXT_CHARS:
+            # The whole source beats any subset of it, and costs fewer tokens than
+            # the retrieval round-trip saves. See FULL_CONTEXT_CHARS.
+            return transcript
+
         if self.retriever:
             try:
                 docs = self.retriever.invoke(self._retrieval_query(category, template))
@@ -526,7 +531,7 @@ class TestGeneratorAgent:
                     continue
 
                 # Generate test cases for each category
-                template = self.templates.get(category.lower().replace(' ', '_'), self.templates['functional'])
+                template = template_for(category)
                 context = self._context_for(category, transcript, template)
                 mix = allocate(quota, allowed, weights)
 

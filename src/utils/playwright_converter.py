@@ -71,6 +71,17 @@ ROLE_WORDS = {
 _ROLE_WORDS_ORDERED = sorted(ROLE_WORDS, key=len, reverse=True)
 
 _QUOTED = re.compile(r'["“‘\']([^"”’\']{1,80})["”’\']')
+
+# A value opening with a determiner or a quality adjective *describes* the data rather
+# than being it. "Enter a valid password in the Password field" was converted to
+# .fill('a valid password'), typing the prose into the field character for character.
+#
+# Deliberately excludes test/sample/dummy/example: "test user" is plausible real test
+# data, and this guard also runs on values the model chose to quote. The trailing
+# \s+\S is what keeps 'a@b.com' (no space after the 'a') a real value.
+_PLACEHOLDER_VALUE = re.compile(
+    r'^(?:a|an|the|some|any|your|valid|invalid|correct|incorrect|wrong|proper|'
+    r'appropriate|suitable|placeholder)\s+\S', re.IGNORECASE)
 # Stripped when reading an element's name out of a step: articles, prepositions and
 # the verbs the step itself is built from. "Check the Terms checkbox" names "Terms".
 _ARTICLES = {
@@ -90,6 +101,35 @@ UNCONVERTED_CHECK = "unconverted assertion: "
 KEY_NAMES = {'enter', 'tab', 'escape', 'esc', 'space', 'backspace', 'delete', 'end',
              'home', 'pageup', 'pagedown', 'arrowup', 'arrowdown', 'arrowleft',
              'arrowright', 'up', 'down', 'left', 'right'}
+
+
+def _url_pattern(url):
+    """A `to_have_url` argument that tolerates a query string the app adds itself.
+
+    An exact whole-string match on a full URL is brittle. `The URL is
+    'https://admin-demo.nopcommerce.com/login'` was compiled to an exact match and
+    failed against the redirect the app actually performed --
+    `.../login?returnUrl=%2Fadmin%2F` -- which was the very behaviour the test was
+    checking. A false failure costs less than a false pass, but it still teaches the
+    reader to ignore red.
+
+    Anchored at both ends, so a different path still fails; only a trailing ?query or
+    #fragment is allowed through, and only when the assertion did not name one itself.
+    """
+    if re.search(r'[?#]', url):      # the assertion pinned a query: hold it to that
+        return repr(url)
+    return f"re.compile({('^' + re.escape(url.rstrip('/')) + r'/?([?#].*)?$')!r})"
+
+
+def _reject_placeholder(value):
+    """The value, or an empty string when it only describes the data it stands for.
+
+    Typing "a valid password" into a password box is worse than not typing at all: the
+    step looks converted, so nothing reports a gap, and the assertion after it fails
+    for a reason that has nothing to do with the application. An empty value reaches
+    the caller as a named skip.
+    """
+    return "" if _PLACEHOLDER_VALUE.match(value) else value
 
 
 def _as_key(step):
@@ -341,9 +381,16 @@ class PlaywrightConverter:
             # A step reads "<verb> the <Name> <role>": keep only what follows the
             # last article, so a verb this list has never heard of ("Leave the
             # Password field empty") cannot leak into the element's name.
-            cut = max((i for i, w in enumerate(words) if w.lower() in _ARTICLES), default=-1)
-            kept = [w for w in words[cut + 1:] if w.lower() not in _ARTICLES]
-            kept = kept or [w for w in words if w.lower() not in _ARTICLES]
+            #
+            # Exception: a stop word inside a capitalised run is part of the name, not
+            # a preposition. "Click the LOG IN button" names "LOG IN" -- cutting at
+            # "IN" used to name it "LOG".
+            stop = [w.lower() in _ARTICLES
+                    and not (i and w[:1].isupper() and words[i - 1][:1].isupper())
+                    for i, w in enumerate(words)]
+            cut = max((i for i, flag in enumerate(stop) if flag), default=-1)
+            kept = [w for i, w in enumerate(words) if i > cut and not stop[i]]
+            kept = kept or [w for i, w in enumerate(words) if not stop[i]]
             if kept:
                 return " ".join(kept).strip("\"'.,:")
         return ""
@@ -357,7 +404,7 @@ class PlaywrightConverter:
 
         quoted = _QUOTED.search(step)
         if quoted:
-            return quoted.group(1).strip()
+            return _reject_placeholder(quoted.group(1).strip())
 
         verbs = {'fill': r'(?:type|enter|input|fill(?:\s+in)?)',
                  'select': r'(?:select|choose|pick)',
@@ -366,7 +413,7 @@ class PlaywrightConverter:
             match = re.search(rf'{verbs}\s+(.+?)(?:\s+(?:in|into|on|to|from)\b|$)',
                               step, re.IGNORECASE)
             if match:
-                return match.group(1).strip(" .\"'")
+                return _reject_placeholder(match.group(1).strip(" .\"'"))
         return ""
 
     @staticmethod
@@ -404,7 +451,7 @@ class PlaywrightConverter:
 
         url = re.search(r'https?://[^\s"\']+', expected)
         if url:
-            return f"expect(page).to_have_url({url.group(0).rstrip('.,')!r})"
+            return f"expect(page).to_have_url({_url_pattern(url.group(0).rstrip('.,'))})"
 
         if quoted and re.search(r'\burls?\b|\bredirect', lowered):
             # get_by_text of a URL matches nothing; to_have_url retries while the
@@ -417,6 +464,8 @@ class PlaywrightConverter:
                 return f"expect(page.get_by_text({text!r})).to_be_hidden()"
             return f"expect(page.get_by_text({text!r})).to_be_visible()"
 
+        # A state word is decisive: it came out of the sentence, so pairing it with
+        # the noun the sentence names is a real check.
         locator = self._locator_for(expected)
         if locator:
             if any(w in lowered for w in ('hidden', 'not visible', 'disappear', 'no longer')):
@@ -425,8 +474,13 @@ class PlaywrightConverter:
                 return f"expect({locator}).to_be_enabled()"
             if 'disabled' in lowered:
                 return f"expect({locator}).to_be_disabled()"
-            return f"expect({locator}).to_be_visible()"
 
+        # Nothing quoted, no URL, no state word. _locator_for would fall back to
+        # whatever noun it recognised, which is not necessarily the noun the sentence
+        # is *about*: "An error message is visible next to the password field" located
+        # the password box and asserted it was visible -- true on the login page
+        # whether or not validation ever fired, so the negative test could not fail.
+        # A recorded gap is worth more than a check that always passes.
         return f"pytest.skip({UNCONVERTED_CHECK + expected!r})"
 
     # ------------------------------------------------------------------
